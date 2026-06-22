@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SandboxSpec {
+    #[serde(default)]
+    pub profile: SandboxProfile,
     #[serde(default)]
     pub process: ProcessSpec,
     #[serde(default)]
@@ -30,6 +33,109 @@ impl SandboxSpec {
             anyhow::anyhow!("missing process command; pass a command after -- or set process.cmd")
         })?;
         Ok((cmd, self.process.args.clone()))
+    }
+
+    pub fn effective_policy(&self) -> EffectivePolicy {
+        let mut policy = EffectivePolicy {
+            profile: self.profile,
+            profile_version: crate::metadata::PROFILE_VERSION,
+            process: self.process.clone(),
+            limits: self.limits.clone(),
+            fs: self.fs.clone(),
+            security: self.security.clone(),
+            observe: self.observe.clone(),
+            notes: Vec::new(),
+        };
+
+        match policy.profile {
+            SandboxProfile::AgentDefault | SandboxProfile::WorkspaceWrite => {
+                if policy.fs.write.is_empty() {
+                    let workspace = policy
+                        .process
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    policy.fs.write.push(workspace);
+                    policy.notes.push(
+                        "profile grants write access to the process working directory".to_string(),
+                    );
+                }
+            }
+            SandboxProfile::ReadOnly => {
+                if !policy.fs.write.is_empty() {
+                    policy.notes.push(
+                        "read-only profile was broadened by explicit write allowlist".to_string(),
+                    );
+                }
+            }
+            SandboxProfile::PermissiveObserve => {
+                if policy.security.landlock {
+                    policy.notes.push(
+                        "permissive-observe disables Landlock filesystem restrictions".to_string(),
+                    );
+                }
+                policy.security.landlock = false;
+            }
+        }
+
+        policy
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectivePolicy {
+    pub profile: SandboxProfile,
+    pub profile_version: u32,
+    pub process: ProcessSpec,
+    pub limits: LimitsSpec,
+    pub fs: FsSpec,
+    pub security: SecuritySpec,
+    pub observe: ObserveSpec,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl EffectivePolicy {
+    pub fn command_line(&self) -> anyhow::Result<(PathBuf, Vec<String>)> {
+        let cmd = self.process.cmd.clone().ok_or_else(|| {
+            anyhow::anyhow!("missing process command; pass a command after -- or set process.cmd")
+        })?;
+        Ok((cmd, self.process.args.clone()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxProfile {
+    #[default]
+    AgentDefault,
+    ReadOnly,
+    WorkspaceWrite,
+    PermissiveObserve,
+}
+
+impl fmt::Display for SandboxProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AgentDefault => "agent-default",
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::PermissiveObserve => "permissive-observe",
+        })
+    }
+}
+
+impl FromStr for SandboxProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "agent-default" | "agent" | "default" => Ok(Self::AgentDefault),
+            "read-only" | "readonly" => Ok(Self::ReadOnly),
+            "workspace-write" | "workspace" => Ok(Self::WorkspaceWrite),
+            "permissive-observe" | "observe" | "permissive" => Ok(Self::PermissiveObserve),
+            other => Err(format!("unknown sandbox profile: {other}")),
+        }
     }
 }
 

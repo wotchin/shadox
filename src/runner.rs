@@ -1,4 +1,5 @@
 use crate::config::{SandboxSpec, SeccompProfile};
+use crate::metadata::{SCHEMA_VERSION, SHADOX_VERSION};
 use crate::report::{EnvReport, RunReport};
 
 #[cfg(target_os = "linux")]
@@ -27,7 +28,36 @@ impl Runner {
         platform::check_env()
     }
 
-    pub fn explain(profile: SeccompProfile) -> serde_json::Value {
+    pub fn explain(spec: &SandboxSpec) -> serde_json::Value {
+        let policy = spec.effective_policy();
+        let seccomp = Self::explain_seccomp(policy.security.seccomp_profile);
+        serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "shadox_version": SHADOX_VERSION,
+            "profile": policy.profile.to_string(),
+            "profile_version": policy.profile_version,
+            "effective_policy": policy,
+            "seccomp": seccomp,
+            "diagnostics": {
+                "summary_hints": true,
+                "failure_kinds": [
+                    "timeout",
+                    "seccomp_denied",
+                    "landlock_denied",
+                    "oom_like",
+                    "signal",
+                    "exit_non_zero"
+                ]
+            },
+            "agent_contract": {
+                "trace": "JSONL event stream for live agent consumption",
+                "summary": "final JSON report with failure classification and hints",
+                "policy": "effective policy is explicit before run"
+            }
+        })
+    }
+
+    pub fn explain_seccomp(profile: SeccompProfile) -> serde_json::Value {
         match profile {
             SeccompProfile::Off => serde_json::json!({
                 "seccomp_profile": "off",

@@ -37,6 +37,19 @@ impl Observer {
 
 fn event_to_map(event: &TraceEvent) -> Map {
     let mut map = Map::new();
+    map.insert(
+        "schema_version".into(),
+        Dynamic::from(event.schema_version as i64),
+    );
+    map.insert(
+        "shadox_version".into(),
+        Dynamic::from(event.shadox_version.clone()),
+    );
+    map.insert("profile".into(), Dynamic::from(event.profile.clone()));
+    map.insert(
+        "profile_version".into(),
+        Dynamic::from(event.profile_version as i64),
+    );
     map.insert("ts".into(), Dynamic::from(event.ts.to_string()));
     map.insert("seq".into(), Dynamic::from(event.seq as i64));
     map.insert("run_id".into(), Dynamic::from(event.run_id.to_string()));
@@ -121,5 +134,22 @@ mod tests {
         let event = TraceEvent::new(1, Uuid::nil(), "stderr.chunk", Some(42), "info", json!({}));
         let findings = observer.on_event(&event).unwrap();
         assert_eq!(findings[0].message, "stderr seen");
+    }
+
+    #[test]
+    fn observer_can_read_agent_contract_fields() {
+        let mut observer = Observer::from_source(
+            r#"
+                fn on_event(event) {
+                    if event.profile == "agent-default" && event.schema_version == 1 {
+                        return #{ message: "contract visible", severity: "info" };
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let event = TraceEvent::new(1, Uuid::nil(), "run.start", None, "info", json!({}));
+        let findings = observer.on_event(&event).unwrap();
+        assert_eq!(findings[0].message, "contract visible");
     }
 }

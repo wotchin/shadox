@@ -18,6 +18,10 @@ pub struct Finding {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
+    pub schema_version: u32,
+    pub shadox_version: String,
+    pub profile: String,
+    pub profile_version: u32,
     pub ts: u128,
     pub seq: u64,
     pub run_id: Uuid,
@@ -36,7 +40,31 @@ impl TraceEvent {
         level: impl Into<String>,
         data: Value,
     ) -> Self {
+        Self::with_context(
+            &TraceContext::default(),
+            seq,
+            run_id,
+            kind,
+            pid,
+            level,
+            data,
+        )
+    }
+
+    pub fn with_context(
+        context: &TraceContext,
+        seq: u64,
+        run_id: Uuid,
+        kind: impl Into<String>,
+        pid: Option<u32>,
+        level: impl Into<String>,
+        data: Value,
+    ) -> Self {
         Self {
+            schema_version: context.schema_version,
+            shadox_version: context.shadox_version.clone(),
+            profile: context.profile.clone(),
+            profile_version: context.profile_version,
             ts: epoch_millis(),
             seq,
             run_id,
@@ -48,11 +76,37 @@ impl TraceEvent {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TraceContext {
+    pub schema_version: u32,
+    pub shadox_version: String,
+    pub profile: String,
+    pub profile_version: u32,
+}
+
+impl TraceContext {
+    pub fn new(profile: impl Into<String>, profile_version: u32) -> Self {
+        Self {
+            schema_version: crate::metadata::SCHEMA_VERSION,
+            shadox_version: crate::metadata::SHADOX_VERSION.to_string(),
+            profile: profile.into(),
+            profile_version,
+        }
+    }
+}
+
+impl Default for TraceContext {
+    fn default() -> Self {
+        Self::new("agent-default", crate::metadata::PROFILE_VERSION)
+    }
+}
+
 pub struct TraceLogger {
     state: Mutex<TraceState>,
 }
 
 struct TraceState {
+    context: TraceContext,
     run_id: Uuid,
     seq: u64,
     writer: Box<dyn Write + Send>,
@@ -62,6 +116,15 @@ struct TraceState {
 
 impl TraceLogger {
     pub fn new(run_id: Uuid, trace: &str, observer: Option<Observer>) -> anyhow::Result<Self> {
+        Self::new_with_context(run_id, trace, observer, TraceContext::default())
+    }
+
+    pub fn new_with_context(
+        run_id: Uuid,
+        trace: &str,
+        observer: Option<Observer>,
+        context: TraceContext,
+    ) -> anyhow::Result<Self> {
         let writer: Box<dyn Write + Send> = if trace == "-" {
             Box::new(BufWriter::new(io::stdout()))
         } else {
@@ -76,6 +139,7 @@ impl TraceLogger {
 
         Ok(Self {
             state: Mutex::new(TraceState {
+                context,
                 run_id,
                 seq: 0,
                 writer,
@@ -113,7 +177,15 @@ impl TraceLogger {
     ) -> anyhow::Result<()> {
         let mut state = self.state.lock().expect("trace state poisoned");
         state.seq += 1;
-        let event = TraceEvent::new(state.seq, state.run_id, kind, pid, level, data);
+        let event = TraceEvent::with_context(
+            &state.context,
+            state.seq,
+            state.run_id,
+            kind,
+            pid,
+            level,
+            data,
+        );
         serde_json::to_writer(&mut state.writer, &event)?;
         state.writer.write_all(b"\n")?;
         state.writer.flush()?;
@@ -123,7 +195,8 @@ impl TraceLogger {
             for finding in findings {
                 state.findings.push(finding.clone());
                 state.seq += 1;
-                let event = TraceEvent::new(
+                let event = TraceEvent::with_context(
+                    &state.context,
                     state.seq,
                     state.run_id,
                     "observer.finding",

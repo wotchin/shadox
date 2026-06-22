@@ -1,5 +1,5 @@
 use serde_json::json;
-use shadox::config::{SandboxSpec, SeccompProfile};
+use shadox::config::{SandboxProfile, SandboxSpec, SeccompProfile};
 use shadox::observer::Observer;
 use shadox::report::{
     Confidence, FailureClassification, FailureKind, OutputReport, ResourceUsage, RunReport,
@@ -29,6 +29,30 @@ fn parses_toml_config_with_defaults() {
     assert_eq!(spec.security.seccomp_profile, SeccompProfile::Basic);
     assert!(spec.observe.capture_stdout);
     assert!(spec.observe.collect_cgroup);
+    assert_eq!(spec.profile, SandboxProfile::AgentDefault);
+}
+
+#[test]
+fn effective_profiles_are_agent_native_and_narrow() {
+    let spec = SandboxSpec::default();
+    let policy = spec.effective_policy();
+    assert_eq!(policy.profile, SandboxProfile::AgentDefault);
+    assert_eq!(policy.fs.write, vec![PathBuf::from(".")]);
+
+    let mut read_only = SandboxSpec {
+        profile: SandboxProfile::ReadOnly,
+        ..SandboxSpec::default()
+    };
+    read_only.fs.read.push(PathBuf::from("/usr/bin"));
+    let policy = read_only.effective_policy();
+    assert!(policy.fs.write.is_empty());
+    assert_eq!(policy.fs.read, vec![PathBuf::from("/usr/bin")]);
+
+    let permissive = SandboxSpec {
+        profile: SandboxProfile::PermissiveObserve,
+        ..SandboxSpec::default()
+    };
+    assert!(!permissive.effective_policy().security.landlock);
 }
 
 #[test]
@@ -56,6 +80,8 @@ fn trace_logger_writes_jsonl_and_observer_finding() {
         .unwrap();
 
     let text = std::fs::read_to_string(trace).unwrap();
+    assert!(text.contains("\"schema_version\":1"));
+    assert!(text.contains("\"profile\":\"agent-default\""));
     assert!(text.contains("\"kind\":\"stderr.chunk\""));
     assert!(text.contains("\"kind\":\"observer.finding\""));
     assert_eq!(logger.findings()[0].message, "stderr seen");
@@ -71,15 +97,21 @@ fn observer_accepts_string_findings() {
 
 #[test]
 fn explain_basic_profile_is_stable() {
-    let value = Runner::explain(SeccompProfile::Basic);
-    let blocked = value["blocked_syscalls"].as_array().unwrap();
+    let value = Runner::explain(&SandboxSpec::default());
+    let blocked = value["seccomp"]["blocked_syscalls"].as_array().unwrap();
     assert!(blocked.iter().any(|item| item == "ptrace"));
-    assert_eq!(value["seccomp_profile"], "basic");
+    assert_eq!(value["profile"], "agent-default");
+    assert_eq!(value["seccomp"]["seccomp_profile"], "basic");
+    assert_eq!(value["effective_policy"]["profile"], "agent-default");
 }
 
 #[test]
 fn run_report_schema_contains_observability_plus_fields() {
     let report = RunReport {
+        schema_version: 1,
+        shadox_version: "0.1.0".to_string(),
+        profile: "agent-default".to_string(),
+        profile_version: 1,
         run_id: Uuid::nil(),
         command: vec!["echo".to_string(), "hello".to_string()],
         exit_code: Some(0),
@@ -102,12 +134,16 @@ fn run_report_schema_contains_observability_plus_fields() {
         },
         denials: Vec::new(),
         findings: Vec::new(),
+        hints: Vec::new(),
     };
 
     let value = serde_json::to_value(report).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["profile"], "agent-default");
     assert_eq!(value["failure"]["kind"], "success");
     assert_eq!(value["output"]["stdout_bytes"], 6);
     assert!(value["resources"].get("cgroup").is_some());
+    assert!(value["hints"].is_array());
 }
 
 #[cfg(not(target_os = "linux"))]

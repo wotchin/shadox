@@ -79,8 +79,22 @@ pub struct ResourceUsage {
     pub cgroup: Option<CgroupStats>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticHint {
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+    pub action: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
+    pub schema_version: u32,
+    pub shadox_version: String,
+    pub profile: String,
+    pub profile_version: u32,
     pub run_id: Uuid,
     pub command: Vec<String>,
     pub exit_code: Option<i32>,
@@ -96,6 +110,8 @@ pub struct RunReport {
     pub denials: Vec<String>,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub hints: Vec<DiagnosticHint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

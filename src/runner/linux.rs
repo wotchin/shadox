@@ -1,10 +1,12 @@
-use crate::config::{FsSpec, LimitsSpec, SandboxSpec, SeccompProfile};
+use crate::config::{EffectivePolicy, FsSpec, LimitsSpec, SandboxSpec, SeccompProfile};
+use crate::diagnostics::diagnostic_hints;
+use crate::metadata::{SCHEMA_VERSION, SHADOX_VERSION};
 use crate::observer::Observer;
 use crate::report::{
     CgroupStats, Confidence, EnvReport, FailureClassification, FailureKind, OutputReport,
     ResourceUsage, RunReport,
 };
-use crate::trace::TraceLogger;
+use crate::trace::{TraceContext, TraceLogger};
 use anyhow::Context;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -21,15 +23,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
-    let (cmd, args) = spec.command_line()?;
+    let effective = spec.effective_policy();
+    let (cmd, args) = effective.command_line()?;
     let run_id = Uuid::new_v4();
     let run_dir = default_run_dir(run_id);
-    let trace_path = spec
+    let trace_path = effective
         .observe
         .trace
         .clone()
         .unwrap_or_else(|| run_dir.join("trace.jsonl").to_string_lossy().to_string());
-    let summary_path = spec
+    let summary_path = effective
         .observe
         .summary
         .clone()
@@ -48,36 +51,46 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         }
     }
 
-    let observer = match &spec.observe.rhai_script {
+    let observer = match &effective.observe.rhai_script {
         Some(path) => Some(
             Observer::from_file(path)
                 .with_context(|| format!("failed to load observer script {}", path.display()))?,
         ),
         None => None,
     };
-    let logger = Arc::new(TraceLogger::new(run_id, &trace_path, observer)?);
+    let trace_context = TraceContext::new(effective.profile.to_string(), effective.profile_version);
+    let logger = Arc::new(TraceLogger::new_with_context(
+        run_id,
+        &trace_path,
+        observer,
+        trace_context,
+    )?);
     logger.emit(
         "run.start",
         None,
         "info",
         json!({
+            "schema_version": SCHEMA_VERSION,
+            "shadox_version": SHADOX_VERSION,
+            "profile": effective.profile,
+            "profile_version": effective.profile_version,
             "command": cmd,
             "args": args,
             "trace_path": trace_path,
             "summary_path": summary_path,
             "observe": {
-                "proc_sample_interval_ms": spec.observe.proc_sample_interval_ms,
-                "collect_cgroup": spec.observe.collect_cgroup,
-                "trace_syscalls": spec.observe.trace_syscalls,
+                "proc_sample_interval_ms": effective.observe.proc_sample_interval_ms,
+                "collect_cgroup": effective.observe.collect_cgroup,
+                "trace_syscalls": effective.observe.trace_syscalls,
             }
         }),
     )?;
 
     let mut denials = Vec::new();
     let mut prepared = PreparedSandbox::prepare(
-        &spec.fs,
-        spec.security.landlock,
-        spec.security.allow_degraded,
+        &effective.fs,
+        effective.security.landlock,
+        effective.security.allow_degraded,
     )?;
     for degradation in &prepared.degraded {
         logger.emit(
@@ -87,7 +100,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
             json!({ "reason": degradation }),
         )?;
     }
-    if spec.observe.trace_syscalls {
+    if effective.observe.trace_syscalls {
         logger.emit(
             "sandbox.degraded",
             None,
@@ -102,19 +115,22 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         None,
         "info",
         json!({
-            "no_new_privs": spec.security.no_new_privs,
-            "landlock": spec.security.landlock,
-            "seccomp_profile": spec.security.seccomp_profile,
-            "allow_degraded": spec.security.allow_degraded,
-            "fs": spec.fs,
-            "limits": spec.limits,
+            "profile": effective.profile,
+            "profile_version": effective.profile_version,
+            "profile_notes": effective.notes,
+            "no_new_privs": effective.security.no_new_privs,
+            "landlock": effective.security.landlock,
+            "seccomp_profile": effective.security.seccomp_profile,
+            "allow_degraded": effective.security.allow_degraded,
+            "fs": effective.fs,
+            "limits": effective.limits,
         }),
     )?;
 
     let landlock_fd = prepared.landlock_ruleset_fd;
-    let limits = spec.limits.clone();
-    let security = spec.security.clone();
-    let cgroup_path = if spec.observe.collect_cgroup {
+    let limits = effective.limits.clone();
+    let security = effective.security.clone();
+    let cgroup_path = if effective.observe.collect_cgroup {
         discover_cgroup_path("self")
     } else {
         None
@@ -128,17 +144,17 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
 
     let mut command = Command::new(&cmd);
     command.args(&args);
-    if let Some(cwd) = &spec.process.cwd {
+    if let Some(cwd) = &effective.process.cwd {
         command.current_dir(cwd);
     }
-    if spec.process.clear_env {
+    if effective.process.clear_env {
         command.env_clear();
     }
-    command.envs(spec.process.env.clone());
-    if spec.observe.capture_stdout {
+    command.envs(effective.process.env.clone());
+    if effective.observe.capture_stdout {
         command.stdout(Stdio::piped());
     }
-    if spec.observe.capture_stderr {
+    if effective.observe.capture_stderr {
         command.stderr(Stdio::piped());
     }
 
@@ -181,7 +197,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         spawn_pipe_reader(stderr, "stderr.chunk", pid, logger.clone(), output.clone())
     });
 
-    let wait = wait_for_child(pid, spec.limits.timeout_ms, logger.clone())?;
+    let wait = wait_for_child(pid, effective.limits.timeout_ms, logger.clone())?;
     if wait.timed_out {
         denials.push("timeout".to_string());
     }
@@ -208,7 +224,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         cgroup: cgroup_final.clone(),
     };
     let output = output.lock().expect("output accumulator poisoned").report();
-    let failure = classify_failure(&wait, &spec, &output, cgroup_final.as_ref());
+    let failure = classify_failure(&wait, &effective, &output, cgroup_final.as_ref());
     if matches!(
         failure.kind,
         FailureKind::Timeout
@@ -232,7 +248,12 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
     let command_vec = std::iter::once(cmd.to_string_lossy().to_string())
         .chain(args)
         .collect::<Vec<_>>();
+    let hints = diagnostic_hints(&failure, &effective, &output);
     let report = RunReport {
+        schema_version: SCHEMA_VERSION,
+        shadox_version: SHADOX_VERSION.to_string(),
+        profile: effective.profile.to_string(),
+        profile_version: effective.profile_version,
         run_id,
         command: command_vec,
         exit_code: wait.exit_code,
@@ -246,6 +267,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         failure,
         denials,
         findings: logger.findings(),
+        hints,
     };
 
     logger.emit(
@@ -639,7 +661,7 @@ struct WaitResult {
 
 fn classify_failure(
     wait: &WaitResult,
-    spec: &SandboxSpec,
+    policy: &EffectivePolicy,
     output: &OutputReport,
     cgroup: Option<&CgroupStats>,
 ) -> FailureClassification {
@@ -680,7 +702,7 @@ fn classify_failure(
     // Without ptrace or audit logs, v1 keeps this intentionally heuristic and
     // labels the confidence rather than pretending exact attribution.
     let stderr = output.stderr_tail.to_ascii_lowercase();
-    if spec.security.landlock
+    if policy.security.landlock
         && (stderr.contains("permission denied") || stderr.contains("operation not permitted"))
     {
         return FailureClassification {
@@ -694,7 +716,7 @@ fn classify_failure(
         };
     }
 
-    if spec.security.seccomp_profile == SeccompProfile::Basic
+    if policy.security.seccomp_profile == SeccompProfile::Basic
         && stderr.contains("operation not permitted")
     {
         return FailureClassification {

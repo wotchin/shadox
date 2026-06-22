@@ -1,3 +1,5 @@
+profile = "agent-default"
+
 [process]
 cmd = "/bin/echo"
 args = ["hello from shadox"]
