@@ -1,0 +1,109 @@
+# shadox
+
+`shadox` is a research-oriented, rootless-first, process-level sandbox runtime for Linux.
+
+It is not a Docker competitor. The goal is to run ordinary commands with a small set of Linux restriction primitives and produce agent-friendly traces that explain what happened.
+
+## What v1 Does
+
+- Runs one process under a supervised sandbox.
+- Applies `no_new_privs`, `rlimit`, Landlock filesystem restrictions, and a basic seccomp blocklist on Linux.
+- Captures stdout/stderr as JSONL trace events.
+- Samples `/proc` for lightweight resource telemetry.
+- Writes a `summary.json` report at the end of the run.
+- Supports Rhai scripts as programmable observation rules.
+- Builds on non-Linux hosts, but `shadox run` is Linux-only.
+
+## Quick Start
+
+```bash
+cargo build
+
+shadox check-env --json
+
+shadox run --config examples/shadox.toml
+
+shadox run \
+  --allow-write . \
+  --timeout-ms 5000 \
+  --observe-script examples/observe.rhai \
+  -- /bin/echo "hello from shadox"
+```
+
+By default, traces are written to:
+
+```text
+.shadox/runs/<timestamp>-<run_id>/trace.jsonl
+.shadox/runs/<timestamp>-<run_id>/summary.json
+```
+
+Pass `--trace -` to stream JSONL events to stdout.
+
+## Trace Event Shape
+
+Each JSONL event uses a stable envelope:
+
+```json
+{
+  "ts": 1790000000000,
+  "seq": 1,
+  "run_id": "00000000-0000-0000-0000-000000000000",
+  "kind": "process.spawn",
+  "pid": 1234,
+  "level": "info",
+  "data": {}
+}
+```
+
+Current event kinds include:
+
+- `run.start`
+- `process.spawn`
+- `proc.sample`
+- `stdout.chunk`
+- `stderr.chunk`
+- `sandbox.denied`
+- `sandbox.degraded`
+- `observer.finding`
+- `process.exit`
+- `run.summary`
+
+`syscall.enter` and `syscall.exit` are reserved for the optional ptrace-backed syscall trace mode.
+
+## Programmable Observation
+
+Rhai scripts can define an `on_event(event)` hook. The hook cannot mutate sandbox policy in v1; it only emits findings.
+
+```rhai
+fn on_event(event) {
+    if event.kind == "stderr.chunk" {
+        return #{
+            message: "process wrote to stderr",
+            severity: "warn",
+            tags: ["stderr"]
+        };
+    }
+}
+```
+
+The event passed to Rhai contains:
+
+- `ts`
+- `seq`
+- `run_id`
+- `kind`
+- `pid`
+- `level`
+- `data_json`
+
+## Security Model
+
+`shadox` is a research sandbox and should not be treated as a hardened security boundary.
+
+The default posture is fail-closed. If a requested security primitive is unavailable, the run fails unless `--allow-degraded` is set. Degraded runs are marked in the trace.
+
+The v1 seccomp profile is a conservative blocklist for obviously privileged or introspection-oriented syscalls. Future versions may add strict allowlist profiles.
+
+## Linux Notes
+
+`shadox run` expects Linux with procfs. Landlock requires a recent Linux kernel. Rootless namespace work is intentionally left out of v1; the first milestone focuses on restriction and observability rather than container semantics.

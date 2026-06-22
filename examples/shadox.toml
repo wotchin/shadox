@@ -1,0 +1,28 @@
+[process]
+cmd = "/bin/echo"
+args = ["hello from shadox"]
+cwd = "."
+clear_env = false
+
+[limits]
+timeout_ms = 5000
+cpu_time_secs = 2
+open_files = 128
+file_size_bytes = 1048576
+max_processes = 32
+
+[fs]
+write = ["."]
+
+[security]
+no_new_privs = true
+landlock = true
+seccomp_profile = "basic"
+allow_degraded = false
+
+[observe]
+capture_stdout = true
+capture_stderr = true
+proc_sample_interval_ms = 100
+trace_syscalls = false
+rhai_script = "examples/observe.rhai"
