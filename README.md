@@ -9,8 +9,10 @@ It is not a Docker competitor. The goal is to run ordinary commands with a small
 - Runs one process under a supervised sandbox.
 - Applies `no_new_privs`, `rlimit`, Landlock filesystem restrictions, and a basic seccomp blocklist on Linux.
 - Captures stdout/stderr as JSONL trace events.
-- Samples `/proc` for lightweight resource telemetry.
+- Samples `/proc` for lightweight process-tree resource telemetry.
+- Reads cgroup v2 stats when available, without creating or managing cgroups.
 - Writes a `summary.json` report at the end of the run.
+- Classifies failures as timeout, signal, non-zero exit, seccomp-denied, Landlock-like denial, or OOM-like.
 - Supports Rhai scripts as programmable observation rules.
 - Builds on non-Linux hosts, but `shadox run` is Linux-only.
 
@@ -58,17 +60,31 @@ Each JSONL event uses a stable envelope:
 Current event kinds include:
 
 - `run.start`
+- `sandbox.policy`
+- `sandbox.degraded`
+- `cgroup.detected`
 - `process.spawn`
 - `proc.sample`
 - `stdout.chunk`
 - `stderr.chunk`
 - `sandbox.denied`
-- `sandbox.degraded`
 - `observer.finding`
 - `process.exit`
 - `run.summary`
 
-`syscall.enter` and `syscall.exit` are reserved for the optional ptrace-backed syscall trace mode.
+`syscall.enter` and `syscall.exit` are reserved for a future ptrace-backed syscall trace mode. In lightweight v1, `--trace-syscalls` records a `sandbox.degraded` event instead of silently pretending syscall tracing is active.
+
+## Summary Report
+
+`summary.json` is meant to be consumed directly by an agent. It includes:
+
+- process result: `exit_code`, `signal`, `timed_out`
+- failure classification: `failure.kind`, `failure.confidence`, `failure.evidence`
+- resource summary: CPU time, max RSS, IO bytes, and optional cgroup v2 stats
+- output summary: stdout/stderr byte counts and 4 KiB tails
+- observer findings emitted by Rhai rules
+
+Landlock denials usually appear to the child as ordinary `EACCES` or `EPERM`, so v1 classifies them with medium confidence based on stderr signatures. Seccomp denials in the basic profile use `SIGSYS`, which gives the parent a high-confidence classification signal.
 
 ## Programmable Observation
 

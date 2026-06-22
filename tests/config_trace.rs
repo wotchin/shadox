@@ -1,8 +1,12 @@
 use serde_json::json;
 use shadox::config::{SandboxSpec, SeccompProfile};
 use shadox::observer::Observer;
+use shadox::report::{
+    Confidence, FailureClassification, FailureKind, OutputReport, ResourceUsage, RunReport,
+};
 use shadox::runner::Runner;
 use shadox::trace::{TraceEvent, TraceLogger};
+use std::path::PathBuf;
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -24,6 +28,7 @@ fn parses_toml_config_with_defaults() {
     assert!(spec.security.landlock);
     assert_eq!(spec.security.seccomp_profile, SeccompProfile::Basic);
     assert!(spec.observe.capture_stdout);
+    assert!(spec.observe.collect_cgroup);
 }
 
 #[test]
@@ -70,6 +75,39 @@ fn explain_basic_profile_is_stable() {
     let blocked = value["blocked_syscalls"].as_array().unwrap();
     assert!(blocked.iter().any(|item| item == "ptrace"));
     assert_eq!(value["seccomp_profile"], "basic");
+}
+
+#[test]
+fn run_report_schema_contains_observability_plus_fields() {
+    let report = RunReport {
+        run_id: Uuid::nil(),
+        command: vec!["echo".to_string(), "hello".to_string()],
+        exit_code: Some(0),
+        signal: None,
+        timed_out: false,
+        duration_ms: 7,
+        trace_path: "-".to_string(),
+        summary_path: PathBuf::from("summary.json"),
+        resources: ResourceUsage::default(),
+        output: OutputReport {
+            stdout_bytes: 6,
+            stdout_tail: "hello\n".to_string(),
+            ..OutputReport::default()
+        },
+        failure: FailureClassification {
+            kind: FailureKind::Success,
+            confidence: Confidence::High,
+            reason: "ok".to_string(),
+            evidence: Vec::new(),
+        },
+        denials: Vec::new(),
+        findings: Vec::new(),
+    };
+
+    let value = serde_json::to_value(report).unwrap();
+    assert_eq!(value["failure"]["kind"], "success");
+    assert_eq!(value["output"]["stdout_bytes"], 6);
+    assert!(value["resources"].get("cgroup").is_some());
 }
 
 #[cfg(not(target_os = "linux"))]

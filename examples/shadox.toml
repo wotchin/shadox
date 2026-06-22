@@ -23,6 +23,7 @@ allow_degraded = false
 [observe]
 capture_stdout = true
 capture_stderr = true
+collect_cgroup = true
 proc_sample_interval_ms = 100
 trace_syscalls = false
 rhai_script = "examples/observe.rhai"

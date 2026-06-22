@@ -1,6 +1,9 @@
 use crate::config::{FsSpec, LimitsSpec, SandboxSpec, SeccompProfile};
 use crate::observer::Observer;
-use crate::report::{EnvReport, ResourceUsage, RunReport};
+use crate::report::{
+    CgroupStats, Confidence, EnvReport, FailureClassification, FailureKind, OutputReport,
+    ResourceUsage, RunReport,
+};
 use crate::trace::TraceLogger;
 use anyhow::Context;
 use serde_json::json;
@@ -62,6 +65,11 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
             "args": args,
             "trace_path": trace_path,
             "summary_path": summary_path,
+            "observe": {
+                "proc_sample_interval_ms": spec.observe.proc_sample_interval_ms,
+                "collect_cgroup": spec.observe.collect_cgroup,
+                "trace_syscalls": spec.observe.trace_syscalls,
+            }
         }),
     )?;
 
@@ -79,10 +87,44 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
             json!({ "reason": degradation }),
         )?;
     }
+    if spec.observe.trace_syscalls {
+        logger.emit(
+            "sandbox.degraded",
+            None,
+            "warn",
+            json!({
+                "reason": "trace_syscalls was requested, but lightweight v1 does not enable ptrace syscall timelines"
+            }),
+        )?;
+    }
+    logger.emit(
+        "sandbox.policy",
+        None,
+        "info",
+        json!({
+            "no_new_privs": spec.security.no_new_privs,
+            "landlock": spec.security.landlock,
+            "seccomp_profile": spec.security.seccomp_profile,
+            "allow_degraded": spec.security.allow_degraded,
+            "fs": spec.fs,
+            "limits": spec.limits,
+        }),
+    )?;
 
     let landlock_fd = prepared.landlock_ruleset_fd;
     let limits = spec.limits.clone();
     let security = spec.security.clone();
+    let cgroup_path = if spec.observe.collect_cgroup {
+        discover_cgroup_path("self")
+    } else {
+        None
+    };
+    let cgroup_before = cgroup_path
+        .as_ref()
+        .and_then(|path| read_cgroup_stats(path, None));
+    if let Some(path) = &cgroup_path {
+        logger.emit("cgroup.detected", None, "debug", json!({ "path": path }))?;
+    }
 
     let mut command = Command::new(&cmd);
     command.args(&args);
@@ -128,16 +170,16 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         logger.clone(),
         stop_sampler.clone(),
         last_sample.clone(),
+        cgroup_path.clone(),
     );
 
-    let stdout_thread = child
-        .stdout
-        .take()
-        .map(|stdout| spawn_pipe_reader(stdout, "stdout.chunk", pid, logger.clone()));
-    let stderr_thread = child
-        .stderr
-        .take()
-        .map(|stderr| spawn_pipe_reader(stderr, "stderr.chunk", pid, logger.clone()));
+    let output = Arc::new(Mutex::new(OutputAccumulator::default()));
+    let stdout_thread = child.stdout.take().map(|stdout| {
+        spawn_pipe_reader(stdout, "stdout.chunk", pid, logger.clone(), output.clone())
+    });
+    let stderr_thread = child.stderr.take().map(|stderr| {
+        spawn_pipe_reader(stderr, "stderr.chunk", pid, logger.clone(), output.clone())
+    });
 
     let wait = wait_for_child(pid, spec.limits.timeout_ms, logger.clone())?;
     if wait.timed_out {
@@ -154,13 +196,38 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
     }
 
     let last_sample = last_sample.lock().expect("proc sample poisoned").clone();
+    let cgroup_final = cgroup_path
+        .as_ref()
+        .and_then(|path| read_cgroup_stats(path, cgroup_before.as_ref()));
     let resources = ResourceUsage {
         user_cpu_ms: wait.rusage.as_ref().map(user_cpu_ms),
         system_cpu_ms: wait.rusage.as_ref().map(system_cpu_ms),
         max_rss_kb: wait.rusage.as_ref().map(|usage| usage.ru_maxrss),
         read_bytes: last_sample.as_ref().map(|sample| sample.read_bytes),
         write_bytes: last_sample.as_ref().map(|sample| sample.write_bytes),
+        cgroup: cgroup_final.clone(),
     };
+    let output = output.lock().expect("output accumulator poisoned").report();
+    let failure = classify_failure(&wait, &spec, &output, cgroup_final.as_ref());
+    if matches!(
+        failure.kind,
+        FailureKind::Timeout
+            | FailureKind::SeccompDenied
+            | FailureKind::LandlockDenied
+            | FailureKind::OomLike
+    ) {
+        logger.emit(
+            "sandbox.denied",
+            Some(pid),
+            "error",
+            json!({
+                "kind": failure.kind,
+                "confidence": failure.confidence,
+                "reason": failure.reason,
+                "evidence": failure.evidence,
+            }),
+        )?;
+    }
 
     let command_vec = std::iter::once(cmd.to_string_lossy().to_string())
         .chain(args)
@@ -175,6 +242,8 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         trace_path: trace_path.clone(),
         summary_path: summary_path.clone(),
         resources,
+        output,
+        failure,
         denials,
         findings: logger.findings(),
     };
@@ -187,6 +256,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
             "exit_code": report.exit_code,
             "signal": report.signal,
             "timed_out": report.timed_out,
+            "failure": report.failure,
         }),
     )?;
     logger.emit(
@@ -218,6 +288,10 @@ pub fn check_env() -> EnvReport {
     details.insert(
         "cgroup_v2".to_string(),
         json!(Path::new("/sys/fs/cgroup/cgroup.controllers").exists()),
+    );
+    details.insert(
+        "cgroup_path".to_string(),
+        json!(discover_cgroup_path("self")),
     );
     EnvReport {
         platform: "linux".to_string(),
@@ -494,8 +568,7 @@ fn install_basic_seccomp() -> anyhow::Result<()> {
     const BPF_K: u16 = 0x00;
     const BPF_RET: u16 = 0x06;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
-    const SECCOMP_RET_ERRNO: u32 = 0x00050000;
-    const EPERM: u32 = 1;
+    const SECCOMP_RET_TRAP: u32 = 0x00030000;
 
     let blocked = [
         libc::SYS_ptrace,
@@ -528,7 +601,8 @@ fn install_basic_seccomp() -> anyhow::Result<()> {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
-            k: SECCOMP_RET_ERRNO | EPERM,
+            // SIGSYS gives the parent a strong, cheap signal for failure classification.
+            k: SECCOMP_RET_TRAP,
         });
     }
     filters.push(libc::sock_filter {
@@ -561,6 +635,120 @@ struct WaitResult {
     signal: Option<i32>,
     timed_out: bool,
     rusage: Option<libc::rusage>,
+}
+
+fn classify_failure(
+    wait: &WaitResult,
+    spec: &SandboxSpec,
+    output: &OutputReport,
+    cgroup: Option<&CgroupStats>,
+) -> FailureClassification {
+    // Order matters: prefer direct kernel evidence first, then labeled heuristics.
+    if wait.timed_out {
+        return FailureClassification {
+            kind: FailureKind::Timeout,
+            confidence: Confidence::High,
+            reason: "process exceeded configured timeout and was killed".to_string(),
+            evidence: vec!["timed_out=true".to_string()],
+        };
+    }
+
+    if wait.exit_code == Some(0) && wait.signal.is_none() {
+        return FailureClassification::success();
+    }
+
+    if wait.signal == Some(libc::SIGSYS) {
+        return FailureClassification {
+            kind: FailureKind::SeccompDenied,
+            confidence: Confidence::High,
+            reason: "process received SIGSYS, which usually indicates a seccomp trap".to_string(),
+            evidence: vec!["signal=SIGSYS".to_string()],
+        };
+    }
+
+    if looks_oom_like(wait, cgroup) {
+        return FailureClassification {
+            kind: FailureKind::OomLike,
+            confidence: Confidence::Medium,
+            reason: "process was killed and cgroup memory events suggest an OOM-like termination"
+                .to_string(),
+            evidence: oom_evidence(wait, cgroup),
+        };
+    }
+
+    // Landlock denials surface to the sandboxed process as ordinary EACCES/EPERM.
+    // Without ptrace or audit logs, v1 keeps this intentionally heuristic and
+    // labels the confidence rather than pretending exact attribution.
+    let stderr = output.stderr_tail.to_ascii_lowercase();
+    if spec.security.landlock
+        && (stderr.contains("permission denied") || stderr.contains("operation not permitted"))
+    {
+        return FailureClassification {
+            kind: FailureKind::LandlockDenied,
+            confidence: Confidence::Medium,
+            reason: "stderr contains a permission denial while Landlock was enabled".to_string(),
+            evidence: vec![
+                "landlock=true".to_string(),
+                "stderr_permission_denial=true".to_string(),
+            ],
+        };
+    }
+
+    if spec.security.seccomp_profile == SeccompProfile::Basic
+        && stderr.contains("operation not permitted")
+    {
+        return FailureClassification {
+            kind: FailureKind::SeccompDenied,
+            confidence: Confidence::Low,
+            reason: "stderr contains EPERM while the basic seccomp profile was enabled".to_string(),
+            evidence: vec![
+                "seccomp_profile=basic".to_string(),
+                "stderr_eperm=true".to_string(),
+            ],
+        };
+    }
+
+    if let Some(signal) = wait.signal {
+        return FailureClassification {
+            kind: FailureKind::Signal,
+            confidence: Confidence::High,
+            reason: format!("process terminated by signal {signal}"),
+            evidence: vec![format!("signal={signal}")],
+        };
+    }
+
+    FailureClassification {
+        kind: FailureKind::ExitNonZero,
+        confidence: Confidence::High,
+        reason: format!(
+            "process exited with non-zero status {}",
+            wait.exit_code.unwrap_or_default()
+        ),
+        evidence: vec![format!("exit_code={}", wait.exit_code.unwrap_or_default())],
+    }
+}
+
+fn looks_oom_like(wait: &WaitResult, cgroup: Option<&CgroupStats>) -> bool {
+    let killed = wait.signal == Some(libc::SIGKILL);
+    let oom_delta = cgroup
+        .and_then(|stats| stats.memory_events_delta.get("oom_kill").copied())
+        .unwrap_or_default();
+    killed && oom_delta > 0
+}
+
+fn oom_evidence(wait: &WaitResult, cgroup: Option<&CgroupStats>) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if let Some(signal) = wait.signal {
+        evidence.push(format!("signal={signal}"));
+    }
+    if let Some(stats) = cgroup {
+        for (key, value) in &stats.memory_events_delta {
+            if *value != 0 {
+                evidence.push(format!("memory.events.delta.{key}={value}"));
+            }
+        }
+    }
+    evidence
 }
 
 fn wait_for_child(
@@ -629,18 +817,28 @@ fn spawn_proc_sampler(
     logger: Arc<TraceLogger>,
     stop: Arc<AtomicBool>,
     last_sample: Arc<Mutex<Option<ProcSample>>>,
+    cgroup_path: Option<PathBuf>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let interval = Duration::from_millis(interval_ms.max(10));
         while !stop.load(Ordering::SeqCst) {
             if let Some(sample) = collect_proc_tree_sample(root_pid) {
-                let data = json!({
+                let mut data = json!({
                     "pids": sample.pids,
                     "process_count": sample.pids.len(),
                     "rss_kb": sample.rss_kb,
                     "read_bytes": sample.read_bytes,
                     "write_bytes": sample.write_bytes,
                 });
+                if let Some(path) = &cgroup_path
+                    && let Some(stats) = read_cgroup_stats(path, None)
+                    && let Some(object) = data.as_object_mut()
+                {
+                    object.insert(
+                        "cgroup".to_string(),
+                        serde_json::to_value(stats).unwrap_or(json!(null)),
+                    );
+                }
                 *last_sample.lock().expect("proc sample poisoned") = Some(sample);
                 let _ = logger.emit("proc.sample", Some(root_pid), "debug", data);
             }
@@ -734,11 +932,142 @@ fn read_io_bytes(pid: u32) -> Option<(u64, u64)> {
     Some((read_bytes, write_bytes))
 }
 
+fn discover_cgroup_path(proc_name: &str) -> Option<PathBuf> {
+    // v1 never creates or mutates cgroups. It only discovers the ambient cgroup
+    // for observability, which keeps the sandbox rootless and delegation-free.
+    let cgroup_file = format!("/proc/{proc_name}/cgroup");
+    let content = fs::read_to_string(cgroup_file).ok()?;
+    for line in content.lines() {
+        let mut parts = line.splitn(3, ':');
+        let _hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?;
+        if controllers.is_empty() {
+            let relative = path.trim_start_matches('/');
+            return Some(if relative.is_empty() {
+                PathBuf::from("/sys/fs/cgroup")
+            } else {
+                PathBuf::from("/sys/fs/cgroup").join(relative)
+            });
+        }
+    }
+    None
+}
+
+fn read_cgroup_stats(path: &Path, before: Option<&CgroupStats>) -> Option<CgroupStats> {
+    // cgroup v2 files are optional across kernels and environments, so every
+    // field is best-effort and missing files simply become null in JSON.
+    if !path.exists() {
+        return None;
+    }
+
+    let memory_events = read_key_value_u64(path.join("memory.events")).unwrap_or_default();
+    let memory_events_delta = before
+        .map(|before| diff_u64_maps(&before.memory_events, &memory_events))
+        .unwrap_or_default();
+    let cpu = read_key_value_u64(path.join("cpu.stat")).unwrap_or_default();
+
+    Some(CgroupStats {
+        path: Some(path.to_path_buf()),
+        cpu_usage_usec: cpu.get("usage_usec").copied(),
+        cpu_user_usec: cpu.get("user_usec").copied(),
+        cpu_system_usec: cpu.get("system_usec").copied(),
+        memory_current_bytes: read_single_u64(path.join("memory.current")),
+        memory_peak_bytes: read_single_u64(path.join("memory.peak")),
+        memory_events,
+        memory_events_delta,
+        pids_current: read_single_u64(path.join("pids.current")),
+    })
+}
+
+fn read_key_value_u64(path: PathBuf) -> Option<BTreeMap<String, u64>> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut values = BTreeMap::new();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else {
+            continue;
+        };
+        if let Ok(value) = value.parse::<u64>() {
+            values.insert(key.to_string(), value);
+        }
+    }
+    Some(values)
+}
+
+fn read_single_u64(path: PathBuf) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn diff_u64_maps(
+    before: &BTreeMap<String, u64>,
+    after: &BTreeMap<String, u64>,
+) -> BTreeMap<String, i64> {
+    after
+        .iter()
+        .map(|(key, value)| {
+            let before = before.get(key).copied().unwrap_or_default();
+            (key.clone(), *value as i64 - before as i64)
+        })
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct OutputAccumulator {
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+    stdout_tail: String,
+    stderr_tail: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+impl OutputAccumulator {
+    const TAIL_LIMIT_CHARS: usize = 4096;
+
+    fn push(&mut self, kind: &str, bytes: &[u8]) {
+        // Keep byte counts exact, but only retain bounded tails for agent hints.
+        let text = String::from_utf8_lossy(bytes);
+        if kind == "stderr.chunk" {
+            self.stderr_bytes += bytes.len() as u64;
+            Self::append_tail(&mut self.stderr_tail, &mut self.stderr_truncated, &text);
+        } else {
+            self.stdout_bytes += bytes.len() as u64;
+            Self::append_tail(&mut self.stdout_tail, &mut self.stdout_truncated, &text);
+        }
+    }
+
+    fn report(&self) -> OutputReport {
+        OutputReport {
+            stdout_bytes: self.stdout_bytes,
+            stderr_bytes: self.stderr_bytes,
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+            stdout_tail: self.stdout_tail.clone(),
+            stderr_tail: self.stderr_tail.clone(),
+        }
+    }
+
+    fn append_tail(target: &mut String, truncated: &mut bool, text: &str) {
+        target.push_str(text);
+        let char_count = target.chars().count();
+        if char_count > Self::TAIL_LIMIT_CHARS {
+            let keep_from = char_count - Self::TAIL_LIMIT_CHARS;
+            *target = target.chars().skip(keep_from).collect();
+            *truncated = true;
+        }
+    }
+}
+
 fn spawn_pipe_reader<R: Read + Send + 'static>(
     mut reader: R,
     kind: &'static str,
     pid: u32,
     logger: Arc<TraceLogger>,
+    output: Arc<Mutex<OutputAccumulator>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
@@ -746,6 +1075,10 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
+                    output
+                        .lock()
+                        .expect("output accumulator poisoned")
+                        .push(kind, &buffer[..n]);
                     let data = json!({
                         "bytes": n,
                         "text": String::from_utf8_lossy(&buffer[..n]).to_string(),

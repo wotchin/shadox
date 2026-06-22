@@ -114,6 +114,8 @@ pub struct ObserveSpec {
     pub capture_stdout: bool,
     #[serde(default = "default_true")]
     pub capture_stderr: bool,
+    #[serde(default = "default_true")]
+    pub collect_cgroup: bool,
     #[serde(default = "default_proc_sample_interval_ms")]
     pub proc_sample_interval_ms: u64,
     #[serde(default)]
@@ -128,6 +130,7 @@ impl Default for ObserveSpec {
             summary: None,
             capture_stdout: true,
             capture_stderr: true,
+            collect_cgroup: true,
             proc_sample_interval_ms: default_proc_sample_interval_ms(),
             trace_syscalls: false,
             rhai_script: None,
