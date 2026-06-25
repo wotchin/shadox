@@ -9,7 +9,7 @@ use crate::report::{
 use crate::trace::{TraceContext, TraceLogger};
 use anyhow::Context;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
@@ -38,17 +38,16 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         .clone()
         .unwrap_or_else(|| run_dir.join("summary.json"));
 
-    if trace_path != "-" {
-        if let Some(parent) = Path::new(&trace_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+    if trace_path != "-"
+        && let Some(parent) = Path::new(&trace_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
-    if let Some(parent) = summary_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = summary_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let observer = match &effective.observe.rhai_script {
@@ -82,6 +81,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
                 "proc_sample_interval_ms": effective.observe.proc_sample_interval_ms,
                 "collect_cgroup": effective.observe.collect_cgroup,
                 "trace_syscalls": effective.observe.trace_syscalls,
+                "max_trace_output_bytes": effective.observe.max_trace_output_bytes,
             }
         }),
     )?;
@@ -161,7 +161,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
     unsafe {
         command.pre_exec(move || {
             child_pre_exec(&limits, &security, landlock_fd)
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+                .map_err(|err| std::io::Error::other(err.to_string()))
         });
     }
 
@@ -182,7 +182,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
     let last_sample = Arc::new(Mutex::new(None));
     let sampler = spawn_proc_sampler(
         pid,
-        spec.observe.proc_sample_interval_ms,
+        effective.observe.proc_sample_interval_ms,
         logger.clone(),
         stop_sampler.clone(),
         last_sample.clone(),
@@ -191,10 +191,24 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
 
     let output = Arc::new(Mutex::new(OutputAccumulator::default()));
     let stdout_thread = child.stdout.take().map(|stdout| {
-        spawn_pipe_reader(stdout, "stdout.chunk", pid, logger.clone(), output.clone())
+        spawn_pipe_reader(
+            stdout,
+            "stdout.chunk",
+            pid,
+            logger.clone(),
+            output.clone(),
+            effective.observe.max_trace_output_bytes,
+        )
     });
     let stderr_thread = child.stderr.take().map(|stderr| {
-        spawn_pipe_reader(stderr, "stderr.chunk", pid, logger.clone(), output.clone())
+        spawn_pipe_reader(
+            stderr,
+            "stderr.chunk",
+            pid,
+            logger.clone(),
+            output.clone(),
+            effective.observe.max_trace_output_bytes,
+        )
     });
 
     let wait = wait_for_child(pid, effective.limits.timeout_ms, logger.clone())?;
@@ -296,9 +310,26 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
 
 pub fn check_env() -> EnvReport {
     let mut details = BTreeMap::new();
+    let landlock_abi = landlock_abi().ok();
+    let cgroup_v2 = Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+    let default_run_supported = landlock_abi.is_some();
+    let degraded_reasons = if default_run_supported {
+        Vec::<String>::new()
+    } else {
+        vec![
+            "Landlock is unavailable; default runs fail closed unless allow_degraded is set"
+                .to_string(),
+        ]
+    };
+
     details.insert("kernel".to_string(), json!(kernel_release()));
     details.insert("seccomp".to_string(), json!(true));
-    details.insert("landlock_abi".to_string(), json!(landlock_abi().ok()));
+    details.insert("landlock_abi".to_string(), json!(landlock_abi));
+    details.insert(
+        "default_run_supported".to_string(),
+        json!(default_run_supported),
+    );
+    details.insert("degraded_reasons".to_string(), json!(degraded_reasons));
     details.insert(
         "max_user_namespaces".to_string(),
         json!(read_to_string_trimmed("/proc/sys/user/max_user_namespaces").ok()),
@@ -307,17 +338,14 @@ pub fn check_env() -> EnvReport {
         "unprivileged_userns_clone".to_string(),
         json!(read_to_string_trimmed("/proc/sys/kernel/unprivileged_userns_clone").ok()),
     );
-    details.insert(
-        "cgroup_v2".to_string(),
-        json!(Path::new("/sys/fs/cgroup/cgroup.controllers").exists()),
-    );
+    details.insert("cgroup_v2".to_string(), json!(cgroup_v2));
     details.insert(
         "cgroup_path".to_string(),
         json!(discover_cgroup_path("self")),
     );
     EnvReport {
         platform: "linux".to_string(),
-        supported: true,
+        supported: default_run_supported,
         details,
     }
 }
@@ -590,7 +618,12 @@ fn install_basic_seccomp() -> anyhow::Result<()> {
     const BPF_K: u16 = 0x00;
     const BPF_RET: u16 = 0x06;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
-    const SECCOMP_RET_TRAP: u32 = 0x00030000;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
+    const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+    const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+
+    let native_arch = native_audit_arch()
+        .ok_or_else(|| anyhow::anyhow!("basic seccomp is unsupported on this CPU architecture"))?;
 
     let blocked = [
         libc::SYS_ptrace,
@@ -605,13 +638,32 @@ fn install_basic_seccomp() -> anyhow::Result<()> {
         libc::SYS_delete_module,
     ];
 
-    let mut filters = Vec::<libc::sock_filter>::new();
-    filters.push(libc::sock_filter {
-        code: BPF_LD | BPF_W | BPF_ABS,
-        jt: 0,
-        jf: 0,
-        k: 0,
-    });
+    let mut filters = vec![
+        libc::sock_filter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARCH_OFFSET,
+        },
+        libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: native_arch,
+        },
+        libc::sock_filter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_KILL_PROCESS,
+        },
+        libc::sock_filter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        },
+    ];
     for syscall in blocked {
         filters.push(libc::sock_filter {
             code: BPF_JMP | BPF_JEQ | BPF_K,
@@ -623,8 +675,8 @@ fn install_basic_seccomp() -> anyhow::Result<()> {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
-            // SIGSYS gives the parent a strong, cheap signal for failure classification.
-            k: SECCOMP_RET_TRAP,
+            // Uncatchable SIGSYS gives the parent a strong classification signal.
+            k: SECCOMP_RET_KILL_PROCESS,
         });
     }
     filters.push(libc::sock_filter {
@@ -650,6 +702,23 @@ fn install_basic_seccomp() -> anyhow::Result<()> {
         return Err(std::io::Error::last_os_error()).context("failed to install seccomp filter");
     }
     Ok(())
+}
+
+fn native_audit_arch() -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return Some(0xC000003E);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Some(0xC00000B7);
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        return Some(0xC00000F3);
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 struct WaitResult {
@@ -773,6 +842,28 @@ fn oom_evidence(wait: &WaitResult, cgroup: Option<&CgroupStats>) -> Vec<String> 
     evidence
 }
 
+fn kill_process_tree(root_pid: u32) -> Vec<u32> {
+    let mut pids = collect_proc_tree_sample(root_pid)
+        .map(|sample| sample.pids)
+        .unwrap_or_else(|| vec![root_pid]);
+    pids.push(root_pid);
+
+    let mut seen = HashSet::new();
+    pids.retain(|pid| seen.insert(*pid));
+
+    unsafe {
+        libc::kill(-(root_pid as libc::pid_t), libc::SIGKILL);
+    }
+
+    for pid in pids.iter().rev() {
+        unsafe {
+            libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    pids
+}
+
 fn wait_for_child(
     pid: u32,
     timeout_ms: Option<u64>,
@@ -806,20 +897,22 @@ fn wait_for_child(
         if result < 0 {
             return Err(std::io::Error::last_os_error()).context("wait4 failed");
         }
-        if let Some(deadline) = deadline {
-            if !timed_out && Instant::now() >= deadline {
-                timed_out = true;
-                logger.emit(
-                    "sandbox.denied",
-                    Some(pid),
-                    "error",
-                    json!({ "reason": "timeout", "timeout_ms": timeout_ms }),
-                )?;
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
+        if let Some(deadline) = deadline
+            && !timed_out
+            && Instant::now() >= deadline
+        {
+            timed_out = true;
+            let killed_pids = kill_process_tree(pid);
+            logger.emit(
+                "sandbox.denied",
+                Some(pid),
+                "error",
+                json!({
+                    "reason": "timeout",
+                    "timeout_ms": timeout_ms,
+                    "killed_pids": killed_pids,
+                }),
+            )?;
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1041,6 +1134,8 @@ fn diff_u64_maps(
 struct OutputAccumulator {
     stdout_bytes: u64,
     stderr_bytes: u64,
+    stdout_trace_bytes: u64,
+    stderr_trace_bytes: u64,
     stdout_tail: String,
     stderr_tail: String,
     stdout_truncated: bool,
@@ -1050,15 +1145,17 @@ struct OutputAccumulator {
 impl OutputAccumulator {
     const TAIL_LIMIT_CHARS: usize = 4096;
 
-    fn push(&mut self, kind: &str, bytes: &[u8]) {
+    fn push(&mut self, kind: &str, bytes: &[u8], trace_limit_bytes: Option<u64>) -> TraceChunk {
         // Keep byte counts exact, but only retain bounded tails for agent hints.
         let text = String::from_utf8_lossy(bytes);
         if kind == "stderr.chunk" {
             self.stderr_bytes += bytes.len() as u64;
             Self::append_tail(&mut self.stderr_tail, &mut self.stderr_truncated, &text);
+            Self::trace_chunk(&mut self.stderr_trace_bytes, bytes, trace_limit_bytes)
         } else {
             self.stdout_bytes += bytes.len() as u64;
             Self::append_tail(&mut self.stdout_tail, &mut self.stdout_truncated, &text);
+            Self::trace_chunk(&mut self.stdout_trace_bytes, bytes, trace_limit_bytes)
         }
     }
 
@@ -1082,6 +1179,25 @@ impl OutputAccumulator {
             *truncated = true;
         }
     }
+
+    fn trace_chunk(emitted: &mut u64, bytes: &[u8], limit: Option<u64>) -> TraceChunk {
+        let allowed = limit
+            .map(|limit| limit.saturating_sub(*emitted) as usize)
+            .unwrap_or(bytes.len())
+            .min(bytes.len());
+        *emitted = (*emitted).saturating_add(allowed as u64);
+        TraceChunk {
+            text: String::from_utf8_lossy(&bytes[..allowed]).to_string(),
+            truncated: allowed < bytes.len(),
+            omitted_bytes: (bytes.len() - allowed) as u64,
+        }
+    }
+}
+
+struct TraceChunk {
+    text: String,
+    truncated: bool,
+    omitted_bytes: u64,
 }
 
 fn spawn_pipe_reader<R: Read + Send + 'static>(
@@ -1090,6 +1206,7 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
     pid: u32,
     logger: Arc<TraceLogger>,
     output: Arc<Mutex<OutputAccumulator>>,
+    trace_limit_bytes: Option<u64>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
@@ -1097,14 +1214,16 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    output
-                        .lock()
-                        .expect("output accumulator poisoned")
-                        .push(kind, &buffer[..n]);
+                    let trace_chunk = output.lock().expect("output accumulator poisoned").push(
+                        kind,
+                        &buffer[..n],
+                        trace_limit_bytes,
+                    );
                     let data = json!({
                         "bytes": n,
-                        "text": String::from_utf8_lossy(&buffer[..n]).to_string(),
-                        "truncated": false,
+                        "text": trace_chunk.text,
+                        "truncated": trace_chunk.truncated,
+                        "omitted_bytes": trace_chunk.omitted_bytes,
                     });
                     let _ = logger.emit(kind, Some(pid), "info", data);
                 }

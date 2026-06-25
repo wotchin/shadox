@@ -226,6 +226,8 @@ pub struct ObserveSpec {
     pub proc_sample_interval_ms: u64,
     #[serde(default)]
     pub trace_syscalls: bool,
+    #[serde(default = "default_max_trace_output_bytes")]
+    pub max_trace_output_bytes: Option<u64>,
     pub rhai_script: Option<PathBuf>,
 }
 
@@ -239,6 +241,7 @@ impl Default for ObserveSpec {
             collect_cgroup: true,
             proc_sample_interval_ms: default_proc_sample_interval_ms(),
             trace_syscalls: false,
+            max_trace_output_bytes: default_max_trace_output_bytes(),
             rhai_script: None,
         }
     }
@@ -250,4 +253,8 @@ const fn default_true() -> bool {
 
 const fn default_proc_sample_interval_ms() -> u64 {
     100
+}
+
+const fn default_max_trace_output_bytes() -> Option<u64> {
+    Some(1024 * 1024)
 }

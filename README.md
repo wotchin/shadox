@@ -9,6 +9,7 @@ It is not a Docker competitor. The goal is to run ordinary commands with a small
 - Runs one process under a supervised sandbox.
 - Applies `no_new_privs`, `rlimit`, Landlock filesystem restrictions, and a basic seccomp blocklist on Linux.
 - Captures stdout/stderr as JSONL trace events.
+- Bounds trace output text by default while preserving exact byte counts.
 - Samples `/proc` for lightweight process-tree resource telemetry.
 - Reads cgroup v2 stats when available, without creating or managing cgroups.
 - Writes a `summary.json` report at the end of the run.
@@ -45,6 +46,8 @@ By default, traces are written to:
 ```
 
 Pass `--trace -` to stream JSONL events to stdout.
+
+When `--trace -` is used, the CLI writes the final pretty summary to stderr so stdout remains a pure JSONL event stream. The same summary is also emitted as the `run.summary` trace event and written to `summary.json`.
 
 ## Agent-Native Profiles
 
@@ -138,6 +141,8 @@ The event passed to Rhai contains:
 - `pid`
 - `level`
 - `data_json`
+
+Large stdout/stderr streams are budgeted in trace events by `observe.max_trace_output_bytes`, defaulting to 1 MiB per stream. Chunk events keep the original `bytes` value and include `truncated` plus `omitted_bytes` when event text is capped.
 
 ## Security Model
 

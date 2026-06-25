@@ -49,6 +49,8 @@ struct RunArgs {
     observe_script: Option<PathBuf>,
     #[arg(long)]
     trace_syscalls: bool,
+    #[arg(long)]
+    max_trace_output_bytes: Option<u64>,
     #[arg(last = true)]
     command: Vec<String>,
 }
@@ -91,7 +93,11 @@ fn main() -> anyhow::Result<()> {
         Command::Run(args) => {
             let spec = build_spec(args)?;
             let report = Runner::run(spec)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report.trace_path == "-" {
+                eprintln!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         Command::Explain(args) => {
             let spec = build_explain_spec(args)?;
@@ -119,6 +125,9 @@ fn build_spec(args: RunArgs) -> anyhow::Result<SandboxSpec> {
     }
     if args.trace_syscalls {
         spec.observe.trace_syscalls = true;
+    }
+    if let Some(max_trace_output_bytes) = args.max_trace_output_bytes {
+        spec.observe.max_trace_output_bytes = Some(max_trace_output_bytes);
     }
     if let Some(script) = args.observe_script {
         spec.observe.rhai_script = Some(script);
