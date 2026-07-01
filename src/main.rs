@@ -1,10 +1,15 @@
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use shadox::{
     FsSpec, LimitsSpec, ObserveSpec, ProcessSpec, Runner, SandboxProfile, SandboxSpec,
     SeccompProfile, WorkspaceStore,
 };
 use std::path::PathBuf;
+
+const AGENT_GUIDE_MARKDOWN: &str = include_str!("../docs/agent-contract.md");
+const AGENT_GUIDE_SOURCE: &str = "docs/agent-contract.md";
+const AGENT_CAPABILITIES_JSON: &str = include_str!("../docs/agent-capabilities.json");
+const AGENT_CAPABILITIES_SOURCE: &str = "docs/agent-capabilities.json";
 
 #[derive(Debug, Parser)]
 #[command(name = "shadox")]
@@ -18,9 +23,17 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// Inspect host support for shadox runtime primitives.
     CheckEnv(CheckEnvArgs),
+    /// Print the embedded vendor-neutral agent operating guide.
+    AgentGuide(AgentGuideArgs),
+    /// Print machine-readable runtime capabilities for agents.
+    Capabilities(CapabilitiesArgs),
+    /// Run one command with sandbox policy, tracing, and optional workspace recovery.
     Run(RunArgs),
+    /// Show the effective policy without running the command.
     Explain(ExplainArgs),
+    /// Manage versioned workspace checkpoints, journals, replay, and rollback.
     Fs(FsArgs),
 }
 
@@ -28,6 +41,31 @@ enum Command {
 struct CheckEnvArgs {
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AgentGuideArgs {
+    /// Output format for the embedded guide.
+    #[arg(long, value_enum, default_value = "markdown")]
+    format: GuideFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GuideFormat {
+    Markdown,
+    Json,
+}
+
+#[derive(Debug, Args)]
+struct CapabilitiesArgs {
+    /// Output format for the embedded capabilities document.
+    #[arg(long, value_enum, default_value = "json")]
+    format: CapabilitiesFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CapabilitiesFormat {
+    Json,
 }
 
 #[derive(Debug, Args)]
@@ -215,6 +253,8 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Command::AgentGuide(args) => print_agent_guide(args)?,
+        Command::Capabilities(args) => print_capabilities(args)?,
         Command::Run(args) => {
             let spec = build_spec(args)?;
             let report = Runner::run(spec)?;
@@ -231,6 +271,45 @@ fn main() -> anyhow::Result<()> {
         Command::Fs(args) => run_fs_command(args)?,
     }
     Ok(())
+}
+
+fn print_agent_guide(args: AgentGuideArgs) -> anyhow::Result<()> {
+    match args.format {
+        GuideFormat::Markdown => print_embedded_text(AGENT_GUIDE_MARKDOWN),
+        GuideFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "kind": "shadox.agent_guide",
+                    "source": AGENT_GUIDE_SOURCE,
+                    "format": "markdown",
+                    "content": AGENT_GUIDE_MARKDOWN,
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_capabilities(args: CapabilitiesArgs) -> anyhow::Result<()> {
+    match args.format {
+        CapabilitiesFormat::Json => {
+            let capabilities: serde_json::Value = serde_json::from_str(AGENT_CAPABILITIES_JSON)
+                .with_context(|| {
+                    format!("invalid embedded capabilities document {AGENT_CAPABILITIES_SOURCE}")
+                })?;
+            println!("{}", serde_json::to_string_pretty(&capabilities)?);
+        }
+    }
+    Ok(())
+}
+
+fn print_embedded_text(text: &str) {
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
 }
 
 fn build_spec(args: RunArgs) -> anyhow::Result<SandboxSpec> {

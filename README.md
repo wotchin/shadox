@@ -27,6 +27,10 @@ cargo build
 
 shadox check-env --json
 
+shadox agent-guide --format markdown
+
+shadox capabilities --format json
+
 shadox explain --profile agent-default -- /bin/echo "hello from shadox"
 
 shadox run --config examples/shadox.toml
@@ -51,6 +55,18 @@ By default, traces are written to:
 Pass `--trace -` to stream JSONL events to stdout.
 
 When `--trace -` is used, the CLI writes the final pretty summary to stderr so stdout remains a pure JSONL event stream. The same summary is also emitted as the `run.summary` trace event and written to `summary.json`.
+
+## Agent Discovery
+
+`shadox` exposes vendor-neutral guidance for agents through the CLI:
+
+```bash
+shadox agent-guide --format markdown
+shadox agent-guide --format json
+shadox capabilities --format json
+```
+
+The guide is embedded from `docs/agent-contract.md`, and the machine-readable capability document is embedded from `docs/agent-capabilities.json`. This keeps the docs as the source of truth while still allowing a single `shadox` binary to teach agents how to use the runtime.
 
 ## Agent-Native Profiles
 

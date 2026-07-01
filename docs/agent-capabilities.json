@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "kind": "shadox.agent_capabilities",
+  "source": "docs/agent-capabilities.json",
+  "guide": {
+    "command": "shadox agent-guide --format markdown",
+    "source": "docs/agent-contract.md",
+    "description": "Operational guide for agents using shadox as an execution partner."
+  },
+  "runtime": {
+    "name": "shadox",
+    "role": "agent execution partner",
+    "boundary": "Rootless process sandbox with observability and workspace recovery. It is not a hardened container boundary."
+  },
+  "commands": [
+    {
+      "name": "check-env",
+      "usage": "shadox check-env --json",
+      "output": "json",
+      "purpose": "Detect whether the current host can enforce the requested runtime primitives."
+    },
+    {
+      "name": "explain",
+      "usage": "shadox explain [policy flags] -- <command>",
+      "output": "json",
+      "purpose": "Show the effective sandbox policy before executing a command."
+    },
+    {
+      "name": "run",
+      "usage": "shadox run [policy flags] [observation flags] -- <command>",
+      "output": "json summary plus optional jsonl trace",
+      "purpose": "Run one command with sandbox policy, trace capture, diagnostics, and optional versioned workspace transaction handling."
+    },
+    {
+      "name": "fs",
+      "usage": "shadox fs <subcommand>",
+      "output": "json",
+      "purpose": "Manage checkpoints, diffs, rollback, commit, replay, operation journals, and optional FUSE-backed write-level recording."
+    },
+    {
+      "name": "agent-guide",
+      "usage": "shadox agent-guide --format markdown",
+      "output": "markdown or json wrapper",
+      "purpose": "Print the embedded vendor-neutral agent operating guide."
+    },
+    {
+      "name": "capabilities",
+      "usage": "shadox capabilities --format json",
+      "output": "json",
+      "purpose": "Print this embedded machine-readable capability document."
+    }
+  ],
+  "profiles": [
+    {
+      "name": "agent-default",
+      "purpose": "Default agent profile with observability enabled and workspace write access when no explicit write allowlist is provided."
+    },
+    {
+      "name": "workspace-write",
+      "purpose": "Common agent profile for writing only inside the workspace."
+    },
+    {
+      "name": "read-only",
+      "purpose": "Read and execute without filesystem writes."
+    },
+    {
+      "name": "permissive-observe",
+      "purpose": "Trusted diagnostics profile with Landlock disabled and telemetry enabled."
+    }
+  ],
+  "versioned_workspace": {
+    "flags": [
+      "--versioned-workspace <path>",
+      "--rollback-on-failure",
+      "--commit-on-success"
+    ],
+    "summary_fields": [
+      "fs.checkpoint_before",
+      "fs.checkpoint_after",
+      "fs.changed_files",
+      "fs.changes",
+      "fs.journal_path",
+      "fs.committed",
+      "fs.rolled_back",
+      "fs.rollback"
+    ],
+    "recovery_commands": [
+      "shadox fs status .",
+      "shadox fs rollback <checkpoint> --workspace .",
+      "shadox fs commit <checkpoint> --workspace .",
+      "shadox fs materialize <checkpoint> <destination> --workspace .",
+      "shadox fs replay <run_id> <destination> --workspace . --until-seq <n>",
+      "shadox fs replay <run_id> <destination> --workspace . --until-ts <ms>",
+      "shadox fs op-replay <run_id> <destination> --workspace . --until-seq <n>",
+      "shadox fs op-restore <run_id> --workspace . --until-ts <ms>"
+    ]
+  },
+  "agent_rules": [
+    "Use shadox run for commands that can mutate workspace state.",
+    "Read summary.json or the final run summary JSON instead of inferring transaction state from stdout.",
+    "Use rollback-on-failure for risky edits, generators, formatters, migrations, and tests that may leave partial output.",
+    "Use materialize or replay for inspection when the live workspace should not change.",
+    "Commit only when the result should become the new workspace baseline."
+  ]
+}

@@ -2,6 +2,20 @@
 
 `shadox` is an execution partner for agents. The agent remains the planner and calls `shadox` around commands that can change the workspace.
 
+This file is the canonical guide embedded by `shadox agent-guide`. Update this document instead of duplicating agent instructions in CLI strings or vendor-specific skill folders. Machine-readable capability discovery is embedded from `docs/agent-capabilities.json` and exposed by `shadox capabilities --format json`.
+
+## Discovery
+
+Agents should discover shadox through the CLI before using it:
+
+```bash
+shadox agent-guide --format markdown
+shadox capabilities --format json
+shadox check-env --json
+```
+
+Use the Markdown guide for operational policy and the JSON capabilities document for tool selection, command construction, and compatibility checks.
+
 ## Default Pattern
 
 Use `shadox run` for any command that can create, modify, delete, move, generate, or format workspace files:
