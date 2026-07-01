@@ -3,7 +3,7 @@ name = "shadox"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A rootless, process-level, agent-observable sandbox runtime."
+description = "An agent runtime control plane for observable, reversible command execution."
 repository = "https://github.com/wotchin/shadox"
 
 [lib]

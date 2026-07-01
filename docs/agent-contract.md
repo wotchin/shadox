@@ -4,6 +4,16 @@
 
 This file is the canonical guide embedded by `shadox agent-guide`. Update this document instead of duplicating agent instructions in CLI strings or vendor-specific skill folders. Machine-readable capability discovery is embedded from `docs/agent-capabilities.json` and exposed by `shadox capabilities --format json`.
 
+For framework-level positioning, see [Ecosystem Positioning](ecosystem-positioning.md).
+
+## Positioning Boundary
+
+Treat shadox as an agent runtime control plane, not as a hardened sandbox boundary by itself. Its core guarantee is observable and reversible command execution: policy explanation, traces, summaries, diagnostics, checkpointing, rollback, replay, and agent-readable recovery state.
+
+The built-in Linux execution path uses native restrictions such as `no_new_privs`, rlimits, Landlock, and seccomp. These are useful enforcement primitives, but agents should not present them as a hardened multi-tenant or adversarial-code isolation guarantee.
+
+When a task requires hardened isolation, the caller should supply that boundary outside the shadox contract, for example by running shadox inside a trusted container, microVM, remote runner, or dedicated sandbox, or by asking shadox to execute a command that is already wrapped by one. Shadox should remain provider-neutral: do not assume or require provider-specific CLI switches. The stable contract is ordinary command execution plus observability and recovery.
+
 ## Discovery
 
 Agents should discover shadox through the CLI before using it:

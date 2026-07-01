@@ -49,10 +49,19 @@ impl Runner {
                     "exit_non_zero"
                 ]
             },
+            "runtime_positioning": {
+                "role": "agent runtime control plane",
+                "core_guarantee": "observable and reversible command execution",
+                "hardened_isolation": false,
+                "isolation_model": "native Linux restrictions are the built-in enforcement layer, not the product's hardened security boundary",
+                "provider_specific_orchestration": false,
+                "composition_surface": "ordinary command execution and shared workspace filesystem state"
+            },
             "agent_contract": {
                 "trace": "JSONL event stream for live agent consumption",
                 "summary": "final JSON report with failure classification and hints",
-                "policy": "effective policy is explicit before run"
+                "policy": "effective isolation policy is explicit before run",
+                "recovery": "versioned workspace fields describe checkpoints, diffs, rollback, and commit state"
             }
         })
     }

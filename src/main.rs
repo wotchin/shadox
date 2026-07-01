@@ -13,7 +13,7 @@ const AGENT_CAPABILITIES_SOURCE: &str = "docs/agent-capabilities.json";
 
 #[derive(Debug, Parser)]
 #[command(name = "shadox")]
-#[command(about = "Rootless, process-level, agent-observable sandbox runtime")]
+#[command(about = "Agent runtime control plane for observable, reversible command execution")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -29,7 +29,7 @@ enum Command {
     AgentGuide(AgentGuideArgs),
     /// Print machine-readable runtime capabilities for agents.
     Capabilities(CapabilitiesArgs),
-    /// Run one command with sandbox policy, tracing, and optional workspace recovery.
+    /// Run one command with isolation policy, tracing, and optional workspace recovery.
     Run(RunArgs),
     /// Show the effective policy without running the command.
     Explain(ExplainArgs),

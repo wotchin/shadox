@@ -1,6 +1,6 @@
 # Versioned Workspace Design
 
-`shadox` treats the agent as the planner and itself as the execution partner. The agent stays outside the sandbox, while each command can run as a recoverable transaction.
+`shadox` treats the agent as the planner and itself as the execution partner. The agent stays outside the command transaction, while each command can run as a recoverable transaction.
 
 ## Goals
 
@@ -14,7 +14,7 @@ For the agent-facing command contract, see [Agent Contract](agent-contract.md).
 
 ## Non-Goals
 
-- V1 is not a hardened security boundary. Landlock, seccomp, and rlimits remain the enforcement layer.
+- V1 is not a hardened security boundary. Landlock, seccomp, and rlimits are the built-in native enforcement layer; hardened isolation should be supplied by the caller's environment when required.
 - V1 is not a full FUSE filesystem. It observes command boundaries rather than every `write(2)` offset.
 - V1 does not snapshot ignored build or VCS directories such as `.git`, `.shadox`, `target`, and `node_modules`.
 

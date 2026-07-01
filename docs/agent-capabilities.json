@@ -9,8 +9,28 @@
   },
   "runtime": {
     "name": "shadox",
-    "role": "agent execution partner",
-    "boundary": "Rootless process sandbox with observability and workspace recovery. It is not a hardened container boundary."
+    "role": "agent runtime control plane",
+    "core_guarantee": "observable and reversible command execution",
+    "security_boundary": "not_hardened",
+    "boundary": "Native Linux restrictions are the built-in enforcement layer, not the product's hardened security boundary.",
+    "provider_specific_orchestration": false
+  },
+  "isolation": {
+    "model": "caller_composed_external_boundary",
+    "composition_surface": "ordinary command execution and shared workspace filesystem state",
+    "built_in_layer": {
+      "name": "native-linux",
+      "status": "implemented",
+      "primitives": [
+        "no_new_privs",
+        "rlimit",
+        "Landlock",
+        "seccomp"
+      ],
+      "guarantee": "least-privilege local execution for developer workflows, not hardened multi-tenant isolation"
+    },
+    "external_boundary_role": "When hardened isolation is required, the caller or deployment should supply it outside the shadox contract. Shadox remains useful inside or around that boundary because its stable interface is command execution, observability, recovery, and agent-readable state.",
+    "provider_adapters": "not_required"
   },
   "commands": [
     {
@@ -23,13 +43,13 @@
       "name": "explain",
       "usage": "shadox explain [policy flags] -- <command>",
       "output": "json",
-      "purpose": "Show the effective sandbox policy before executing a command."
+      "purpose": "Show the effective isolation policy before executing a command."
     },
     {
       "name": "run",
       "usage": "shadox run [policy flags] [observation flags] -- <command>",
       "output": "json summary plus optional jsonl trace",
-      "purpose": "Run one command with sandbox policy, trace capture, diagnostics, and optional versioned workspace transaction handling."
+      "purpose": "Run one command with isolation policy, trace capture, diagnostics, and optional versioned workspace transaction handling."
     },
     {
       "name": "fs",
@@ -97,6 +117,8 @@
   },
   "agent_rules": [
     "Use shadox run for commands that can mutate workspace state.",
+    "Treat shadox as a recovery and observability control plane; do not describe the built-in native layer as hardened isolation.",
+    "When running adversarial or multi-tenant workloads, rely on the caller's trusted isolation boundary instead of expecting shadox to adapt to a specific provider.",
     "Read summary.json or the final run summary JSON instead of inferring transaction state from stdout.",
     "Use rollback-on-failure for risky edits, generators, formatters, migrations, and tests that may leave partial output.",
     "Use materialize or replay for inspection when the live workspace should not change.",

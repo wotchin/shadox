@@ -41,14 +41,14 @@ pub fn diagnostic_hints(
             "signal_termination",
             "info",
             "The process was terminated by a signal.",
-            "Inspect failure.evidence and stderr_tail to distinguish sandbox policy from application behavior.",
+            "Inspect failure.evidence and stderr_tail to distinguish isolation policy from application behavior.",
             &["signal", "diagnostics"],
         )),
         FailureKind::ExitNonZero => hints.push(hint(
             "non_zero_exit",
             "info",
             "The process exited with a non-zero status.",
-            "Inspect output.stderr_tail and observer findings before changing sandbox policy.",
+            "Inspect output.stderr_tail and observer findings before changing isolation policy.",
             &["process", "diagnostics"],
         )),
     }

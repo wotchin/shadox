@@ -116,6 +116,19 @@ fn explain_basic_profile_is_stable() {
     assert_eq!(value["profile"], "agent-default");
     assert_eq!(value["seccomp"]["seccomp_profile"], "basic");
     assert_eq!(value["effective_policy"]["profile"], "agent-default");
+    assert_eq!(value["runtime_positioning"]["hardened_isolation"], false);
+    assert_eq!(
+        value["runtime_positioning"]["provider_specific_orchestration"],
+        false
+    );
+    assert_eq!(
+        value["runtime_positioning"]["role"],
+        "agent runtime control plane"
+    );
+    assert_eq!(
+        value["agent_contract"]["recovery"],
+        "versioned workspace fields describe checkpoints, diffs, rollback, and commit state"
+    );
 }
 
 #[test]

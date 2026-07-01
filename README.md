@@ -1,24 +1,39 @@
-# shadox
+<p align="center">
+  <img src="docs/assets/logo.svg" alt="shadox" width="760">
+</p>
 
-`shadox` is a research-oriented, rootless-first, process-level sandbox runtime for Linux.
+<p align="center">
+  <a href="https://github.com/wotchin/shadox/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/wotchin/shadox/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-DEA584?logo=rust&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue">
+  <img alt="Runtime" src="https://img.shields.io/badge/runtime-agent%20control%20plane-4DD7A8">
+  <img alt="Boundary" src="https://img.shields.io/badge/isolation-provider%20neutral-5BA8FF">
+</p>
 
-It is not a Docker competitor. The goal is to run ordinary commands with a small set of Linux restriction primitives and produce agent-friendly traces that explain what happened.
+<p align="center">
+  <strong>Observable, reversible command execution for agents.</strong>
+</p>
 
-## What v1 Does
+`shadox` is an agent runtime control plane. It sits between an agent framework and the real execution environment, turning risky shell commands into inspectable transactions with traces, summaries, checkpoints, rollback, replay, and recovery state.
 
-- Runs one process under a supervised sandbox.
-- Applies `no_new_privs`, `rlimit`, Landlock filesystem restrictions, and a basic seccomp blocklist on Linux.
-- Captures stdout/stderr as JSONL trace events.
-- Bounds trace output text by default while preserving exact byte counts.
-- Samples `/proc` for lightweight process-tree resource telemetry.
-- Reads cgroup v2 stats when available, without creating or managing cgroups.
-- Writes a `summary.json` report at the end of the run.
-- Can checkpoint, diff, rollback, and commit a workspace around agent commands.
-- Classifies failures as timeout, signal, non-zero exit, seccomp-denied, Landlock-like denial, or OOM-like.
-- Emits diagnostic hints that tell an agent what to inspect or change next.
-- Explains the effective policy before a run.
-- Supports Rhai scripts as programmable observation rules.
-- Builds on non-Linux hosts, but `shadox run` is Linux-only.
+It is not an agent framework, not a container runtime, and not a hardened security boundary by itself. Agent frameworks orchestrate intent; shadox manages command side effects.
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="shadox architecture" width="1000">
+</p>
+
+## Why Shadox
+
+Agents increasingly write code, run tests, format files, generate assets, and execute migrations. The hard part is not just running a command; it is knowing what happened after the command changed the workspace.
+
+Shadox gives agents a stable execution contract:
+
+- **Observe** every run through JSONL trace events and a final JSON summary.
+- **Explain** the effective execution policy before a command runs.
+- **Recover** from failed or risky commands with checkpoint, diff, rollback, replay, and materialize.
+- **Diagnose** timeouts, non-zero exits, likely Landlock/seccomp denials, signals, and OOM-like failures.
+- **Discover** usage through `shadox agent-guide` and `shadox capabilities`, without vendor-specific skill folders.
+- **Compose** with any caller-provided isolation boundary while staying provider-neutral.
 
 ## Quick Start
 
@@ -26,62 +41,136 @@ It is not a Docker competitor. The goal is to run ordinary commands with a small
 cargo build
 
 shadox check-env --json
-
 shadox agent-guide --format markdown
-
 shadox capabilities --format json
-
-shadox explain --profile agent-default -- /bin/echo "hello from shadox"
-
-shadox run --config examples/shadox.toml
 
 shadox run \
   --profile workspace-write \
   --allow-write . \
   --versioned-workspace . \
   --rollback-on-failure \
-  --timeout-ms 5000 \
-  --observe-script examples/observe.rhai \
-  -- /bin/echo "hello from shadox"
+  --summary .shadox/last-summary.json \
+  --trace .shadox/last-trace.jsonl \
+  -- cargo test
 ```
 
-By default, traces are written to:
+By default, runs write:
 
 ```text
 .shadox/runs/<timestamp>-<run_id>/trace.jsonl
 .shadox/runs/<timestamp>-<run_id>/summary.json
 ```
 
-Pass `--trace -` to stream JSONL events to stdout.
+Pass `--trace -` to stream JSONL events to stdout. When streaming, the final pretty summary is written to stderr so stdout remains a pure JSONL event stream.
 
-When `--trace -` is used, the CLI writes the final pretty summary to stderr so stdout remains a pure JSONL event stream. The same summary is also emitted as the `run.summary` trace event and written to `summary.json`.
+## Agent Integration
 
-## Agent Discovery
+The primary integration surface is the CLI. Any framework that can run a command can use shadox.
 
-`shadox` exposes vendor-neutral guidance for agents through the CLI:
-
-```bash
-shadox agent-guide --format markdown
-shadox agent-guide --format json
-shadox capabilities --format json
+```text
+Agent / planner
+  -> LangGraph, OpenAI Agents SDK, AutoGen, IDE agent, CI bot, or custom loop
+  -> shadox run -- ...
+  -> local shell, WSL, CI runner, container, VM, or remote environment
 ```
 
-The guide is embedded from `docs/agent-contract.md`, and the machine-readable capability document is embedded from `docs/agent-capabilities.json`. This keeps the docs as the source of truth while still allowing a single `shadox` binary to teach agents how to use the runtime.
+Recommended pattern:
 
-## Agent-Native Profiles
+```bash
+shadox run \
+  --profile workspace-write \
+  --allow-write . \
+  --versioned-workspace . \
+  --rollback-on-failure \
+  --summary .shadox/last-summary.json \
+  --trace .shadox/last-trace.jsonl \
+  -- <command>
+```
 
-Profiles are intentionally small policy presets, not container modes:
+After the command exits, the agent should read `summary.json` instead of inferring state from stdout.
 
-- `agent-default`: rootless restrictions, observability on, and write access to the process working directory when no explicit write allowlist is provided.
-- `read-only`: deny filesystem writes by default while keeping ordinary reads and execution usable.
-- `workspace-write`: explicitly expresses the common agent case of writing only inside the workspace.
-- `permissive-observe`: disables Landlock filesystem restrictions and keeps telemetry on for trusted diagnostics.
+| Ecosystem | Use shadox as |
+| --- | --- |
+| LangGraph | A tool node that wraps shell commands and stores `summary.json` in graph state. |
+| OpenAI Agents SDK | An MCP tool surface or small function tool backed by the CLI. |
+| AutoGen | A code executor wrapper around `shadox run`. |
+| IDE agents | A safer shell execution path for edits, tests, formatters, and generators. |
+| CI agents | A transaction log and recovery surface for automated changes. |
+| Custom agents | A process boundary with stable JSON trace and summary contracts. |
 
-CLI flags and TOML fields can still narrow or broaden the effective policy. Use `shadox explain --config shadox.toml` to inspect the final contract before running.
+See [Ecosystem Positioning](docs/ecosystem-positioning.md) for the full integration model.
 
-## Trace Event Shape
+## Core Commands
 
-Each JSONL event uses a stable envelope:
+```bash
+# Discover the runtime contract
+shadox agent-guide --format markdown
+shadox capabilities --format json
+
+# Inspect the effective policy before running
+shadox explain --profile workspace-write --allow-write . -- cargo test
+
+# Run an observable, recoverable command
+shadox run --versioned-workspace . --rollback-on-failure -- cargo test
+
+# Inspect and recover workspace state
+shadox fs status .
+shadox fs log .
+shadox fs diff <checkpoint_a> <checkpoint_b> --workspace .
+shadox fs rollback <checkpoint_id> --workspace .
+shadox fs materialize <checkpoint_id> ./historical-view --workspace .
+shadox fs replay <run_id> ./replayed-view --workspace . --until-seq 3
+```
+
+## Versioned Workspace
+
+With `--versioned-workspace`, shadox turns a command into a workspace transaction:
+
+1. checkpoint before command
+2. command execution with trace capture
+3. checkpoint after command
+4. structured diff and redo journal
+5. rollback on failure when requested
+6. commit on success when requested
+
+```bash
+shadox run \
+  --profile workspace-write \
+  --allow-write . \
+  --versioned-workspace . \
+  --rollback-on-failure \
+  --commit-on-success \
+  -- cargo test
+```
+
+The summary includes an `fs` block with `checkpoint_before`, `checkpoint_after`, `changed_files`, `changes`, `journal_path`, `committed`, and `rolled_back`.
+
+Replay commands accept `--until-seq` and `--until-ts`, so agents can materialize a historical view without mutating the live workspace. `op-restore` can apply operation replay back to the live workspace when the user wants an actual rollback to an event boundary or timestamp.
+
+```bash
+shadox fs op-journal <run_id> --workspace .
+shadox fs op-replay <run_id> ./operation-view --workspace . --until-seq 3
+shadox fs op-restore <run_id> --workspace . --until-ts 1790000000000
+```
+
+For the detailed design, see [Versioned Workspace Design](docs/versioned-workspace.md).
+
+## Execution Model
+
+The built-in Linux path uses native enforcement primitives:
+
+- `no_new_privs`
+- rlimits
+- Landlock filesystem restrictions
+- a basic seccomp blocklist
+
+These are useful for least-privilege developer workflows and policy diagnostics, but shadox should not be presented as a hardened multi-tenant isolation boundary. If a workload needs hardened isolation, the caller should supply that boundary outside the shadox contract, such as a trusted container, VM, remote runner, or dedicated sandbox.
+
+Shadox stays provider-neutral: it does not need provider-specific CLI switches to remain useful. The universal interface is ordinary command execution plus trace, summary, diagnostics, checkpoint, rollback, replay, and materialize.
+
+## Trace And Summary
+
+Each JSONL trace event uses a stable envelope:
 
 ```json
 {
@@ -99,92 +188,11 @@ Each JSONL event uses a stable envelope:
 }
 ```
 
-Current event kinds include:
-
-- `run.start`
-- `sandbox.policy`
-- `sandbox.degraded`
-- `cgroup.detected`
-- `process.spawn`
-- `proc.sample`
-- `stdout.chunk`
-- `stderr.chunk`
-- `sandbox.denied`
-- `observer.finding`
-- `process.exit`
-- `run.summary`
-
-`syscall.enter` and `syscall.exit` are reserved for a future ptrace-backed syscall trace mode. In lightweight v1, `--trace-syscalls` records a `sandbox.degraded` event instead of silently pretending syscall tracing is active.
-
-## Summary Report
-
-`summary.json` is meant to be consumed directly by an agent. It includes:
-
-- process result: `exit_code`, `signal`, `timed_out`
-- failure classification: `failure.kind`, `failure.confidence`, `failure.evidence`
-- resource summary: CPU time, max RSS, IO bytes, and optional cgroup v2 stats
-- output summary: stdout/stderr byte counts and 4 KiB tails
-- observer findings emitted by Rhai rules
-- diagnostic hints with `code`, `severity`, `message`, `action`, and `tags`
-
-Landlock denials usually appear to the child as ordinary `EACCES` or `EPERM`, so v1 classifies them with medium confidence based on stderr signatures. Seccomp denials in the basic profile use `SIGSYS`, which gives the parent a high-confidence classification signal.
-
-The top-level summary also includes `schema_version`, `shadox_version`, `profile`, and `profile_version` so agents can consume reports with explicit compatibility checks.
-
-## Versioned Workspace
-
-`shadox` can act as a transaction layer for agent command execution. In v1 this is command-boundary versioning: shadox records a full workspace checkpoint before the command, records another checkpoint after it, writes a JSONL change journal, and can roll the workspace back when the command fails.
-
-```bash
-shadox fs init .
-shadox fs checkpoint . --message "known good"
-shadox fs checkpoint . --source-run-id <run_id> --message "merge run"
-
-shadox run \
-  --profile workspace-write \
-  --allow-write . \
-  --versioned-workspace . \
-  --rollback-on-failure \
-  --commit-on-success \
-  -- cargo test
-```
-
-Useful workspace commands:
-
-```bash
-shadox fs log .
-shadox fs diff <checkpoint_a> <checkpoint_b> --workspace .
-shadox fs rollback <checkpoint_id> --workspace .
-shadox fs commit <checkpoint_id> --workspace .
-shadox fs status .
-shadox fs materialize <checkpoint_id> ./historical-view --workspace .
-shadox fs journal <run_id> --workspace .
-shadox fs replay <run_id> ./replayed-view --workspace . --until-seq 3
-shadox fs op-journal <run_id> --workspace .
-shadox fs op-replay <run_id> ./operation-view --workspace . --until-seq 3
-shadox fs op-replay <run_id> ./as-of-view --workspace . --until-ts 1790000000000
-shadox fs op-restore <run_id> --workspace . --until-ts 1790000000000
-shadox fs verify .
-shadox fs gc .
-
-cargo run --features fuse -- fs mount ./backing ./mnt --workspace ./backing
-```
-
-The run summary includes an `fs` block with `checkpoint_before`, `checkpoint_after`, `journal_path`, changed paths, and whether the run committed or rolled back. File renames are surfaced as `renamed` changes when the content fingerprint matches. The journal is a stable JSONL redo stream with operation names such as `create_file`, `write_file`, `delete_path`, and `rename_path`. This makes each agent command behave like an observable transaction: inspect the summary, keep good changes, recover bad ones, materialize a historical checkpoint, or replay the first N journal events into a separate directory without changing the live workspace.
-
-Replay commands accept `--until-seq` and `--until-ts`, so agents can materialize a view at an event boundary or timestamp without mutating the live workspace. `op-restore` applies an operation replay back to the live workspace when the user wants an actual rollback to that event boundary or timestamp.
-
-V1 stores checkpoint manifests and SHA-256 content objects under `.shadox/fs`. It intentionally skips `.shadox`, `.git`, `target`, and `node_modules`. Use `shadox fs verify` to check that all checkpoint objects are present and uncorrupted, and `shadox fs gc` to remove unreferenced objects.
-
-Committing a checkpoint with a `source_run_id`, or creating a checkpoint with `--source-run-id`, compacts that run: active redo logs are moved under `journals/compacted/` or `operation-journals/compacted/`. `journal`, `replay`, `op-journal`, and `op-replay` still find compacted logs automatically.
-
-The V2 operation-level redo path is available through the Rust API, `op-journal` / `op-replay`, and the optional Linux FUSE passthrough adapter. Build with `--features fuse`, then mount a backing directory into a mountpoint with `shadox fs mount <backing> <mountpoint> --workspace <backing>`. Writes through the mountpoint are applied to the backing directory and recorded as operation-level redo events.
-
-See `docs/agent-contract.md` for the exact workflow an agent should follow when wrapping commands, reading summaries, and recovering changes.
+`summary.json` includes process result, failure classification, resource usage, output tails, diagnostics, observer findings, and optional versioned workspace state. The top-level schema fields let agents consume reports with explicit compatibility checks.
 
 ## Programmable Observation
 
-Rhai scripts can define an `on_event(event)` hook. The hook cannot mutate sandbox policy in v1; it only emits findings.
+Rhai scripts can define an `on_event(event)` hook. The hook cannot mutate isolation policy in v1; it only emits findings.
 
 ```rhai
 fn on_event(event) {
@@ -198,30 +206,19 @@ fn on_event(event) {
 }
 ```
 
-The event passed to Rhai contains:
+## Status
 
-- `schema_version`
-- `shadox_version`
-- `profile`
-- `profile_version`
-- `ts`
-- `seq`
-- `run_id`
-- `kind`
-- `pid`
-- `level`
-- `data_json`
+Shadox is a research-oriented project that is ready for controlled developer workflows and internal agent execution experiments. Treat the recovery and observability contracts as the core product surface. Treat hardened isolation as caller-supplied infrastructure.
 
-Large stdout/stderr streams are budgeted in trace events by `observe.max_trace_output_bytes`, defaulting to 1 MiB per stream. Chunk events keep the original `bytes` value and include `truncated` plus `omitted_bytes` when event text is capped.
+`shadox run` expects Linux with procfs. The project builds on non-Linux hosts, but command execution is Linux-only.
 
-## Security Model
+## Docs
 
-`shadox` is a research sandbox and should not be treated as a hardened security boundary.
+- [Agent Contract](docs/agent-contract.md)
+- [Ecosystem Positioning](docs/ecosystem-positioning.md)
+- [Versioned Workspace Design](docs/versioned-workspace.md)
+- [Agent Capabilities JSON](docs/agent-capabilities.json)
 
-The default posture is fail-closed. If a requested security primitive is unavailable, the run fails unless `--allow-degraded` is set. Degraded runs are marked in the trace.
+## License
 
-The v1 seccomp profile is a conservative blocklist for obviously privileged or introspection-oriented syscalls. Future versions may add strict allowlist profiles.
-
-## Linux Notes
-
-`shadox run` expects Linux with procfs. Landlock requires a recent Linux kernel. Rootless namespace work is intentionally left out of v1; the first milestone focuses on restriction and observability rather than container semantics.
+Apache-2.0
