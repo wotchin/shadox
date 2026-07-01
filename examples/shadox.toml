@@ -30,3 +30,8 @@ proc_sample_interval_ms = 100
 trace_syscalls = false
 max_trace_output_bytes = 1048576
 rhai_script = "examples/observe.rhai"
+
+[versioned_workspace]
+workspace = "."
+rollback_on_failure = true
+commit_on_success = false

@@ -1,4 +1,5 @@
 use crate::trace::Finding;
+use crate::versioned_fs::{WorkspaceChange, WorkspaceRollbackReport};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -89,6 +90,21 @@ pub struct DiagnosticHint {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionedFsReport {
+    pub enabled: bool,
+    pub workspace: PathBuf,
+    pub checkpoint_before: String,
+    pub checkpoint_after: String,
+    pub journal_path: PathBuf,
+    pub changed_files: usize,
+    #[serde(default)]
+    pub changes: Vec<WorkspaceChange>,
+    pub committed: bool,
+    pub rolled_back: bool,
+    pub rollback: Option<WorkspaceRollbackReport>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
     pub schema_version: u32,
@@ -112,6 +128,8 @@ pub struct RunReport {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub hints: Vec<DiagnosticHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs: Option<VersionedFsReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

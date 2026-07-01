@@ -23,5 +23,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check FUSE feature
+        run: cargo check --features fuse
+
       - name: Test
         run: cargo test --all-targets

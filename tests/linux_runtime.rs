@@ -1,9 +1,12 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::Value;
+use shadox::WorkspaceStore;
 use shadox::config::{
-    LimitsSpec, ObserveSpec, ProcessSpec, SandboxProfile, SandboxSpec, SeccompProfile, SecuritySpec,
+    LimitsSpec, ObserveSpec, ProcessSpec, SandboxProfile, SandboxSpec, SeccompProfile,
+    SecuritySpec, VersionedWorkspaceSpec,
 };
+use shadox::report::FailureKind;
 use shadox::runner::Runner;
 use std::path::Path;
 use std::process::Command;
@@ -101,6 +104,105 @@ fn timeout_kills_detached_descendant() {
         .parse()
         .unwrap();
     assert_process_exits(detached_pid);
+}
+
+#[test]
+fn versioned_workspace_commits_successful_run() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("a.txt"), "one").unwrap();
+
+    let report = Runner::run(versioned_workspace_spec(
+        &workspace,
+        dir.path(),
+        "printf two > \"$1/a.txt\"",
+        true,
+        false,
+    ))
+    .unwrap();
+
+    let fs = report.fs.expect("versioned workspace report");
+    assert_eq!(report.failure.kind, FailureKind::Success);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+        "two"
+    );
+    assert!(fs.committed);
+    assert!(!fs.rolled_back);
+    assert_eq!(fs.changed_files, 1);
+    assert!(fs.journal_path.is_file());
+
+    let store = WorkspaceStore::open(&workspace).unwrap();
+    assert_eq!(store.head().unwrap(), Some(fs.checkpoint_after));
+}
+
+#[test]
+fn versioned_workspace_rolls_back_failed_run() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("a.txt"), "one").unwrap();
+
+    let report = Runner::run(versioned_workspace_spec(
+        &workspace,
+        dir.path(),
+        "printf bad > \"$1/a.txt\"; exit 7",
+        false,
+        true,
+    ))
+    .unwrap();
+
+    let fs = report.fs.expect("versioned workspace report");
+    assert_eq!(report.exit_code, Some(7));
+    assert_eq!(report.failure.kind, FailureKind::ExitNonZero);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+        "one"
+    );
+    assert!(!fs.committed);
+    assert!(fs.rolled_back);
+    assert!(fs.rollback.is_some());
+    assert_eq!(fs.changed_files, 1);
+    assert!(fs.journal_path.is_file());
+}
+
+fn versioned_workspace_spec(
+    workspace: &Path,
+    output_dir: &Path,
+    shell_script: &str,
+    commit_on_success: bool,
+    rollback_on_failure: bool,
+) -> SandboxSpec {
+    SandboxSpec {
+        profile: SandboxProfile::PermissiveObserve,
+        security: SecuritySpec {
+            landlock: false,
+            seccomp_profile: SeccompProfile::Off,
+            ..SecuritySpec::default()
+        },
+        observe: ObserveSpec {
+            trace: Some(output_dir.join("trace.jsonl").to_string_lossy().to_string()),
+            summary: Some(output_dir.join("summary.json")),
+            ..ObserveSpec::default()
+        },
+        process: ProcessSpec {
+            cmd: Some("/bin/sh".into()),
+            args: vec![
+                "-c".to_string(),
+                shell_script.to_string(),
+                "versioned-workspace-test".to_string(),
+                workspace.to_string_lossy().to_string(),
+            ],
+            ..ProcessSpec::default()
+        },
+        versioned_workspace: VersionedWorkspaceSpec {
+            workspace: Some(workspace.to_path_buf()),
+            rollback_on_failure,
+            commit_on_success,
+        },
+        ..SandboxSpec::default()
+    }
 }
 
 fn assert_process_exits(pid: u32) {

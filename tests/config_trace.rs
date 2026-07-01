@@ -19,6 +19,10 @@ fn parses_toml_config_with_defaults() {
 
         [security]
         seccomp_profile = "basic"
+
+        [versioned_workspace]
+        workspace = "."
+        rollback_on_failure = true
     "#;
 
     let spec: SandboxSpec = toml::from_str(config).unwrap();
@@ -27,6 +31,15 @@ fn parses_toml_config_with_defaults() {
     assert!(spec.security.no_new_privs);
     assert!(spec.security.landlock);
     assert_eq!(spec.security.seccomp_profile, SeccompProfile::Basic);
+    assert_eq!(
+        spec.versioned_workspace
+            .workspace
+            .as_ref()
+            .unwrap()
+            .to_string_lossy(),
+        "."
+    );
+    assert!(spec.versioned_workspace.rollback_on_failure);
     assert!(spec.observe.capture_stdout);
     assert!(spec.observe.collect_cgroup);
     assert_eq!(spec.profile, SandboxProfile::AgentDefault);
@@ -135,6 +148,7 @@ fn run_report_schema_contains_observability_plus_fields() {
         denials: Vec::new(),
         findings: Vec::new(),
         hints: Vec::new(),
+        fs: None,
     };
 
     let value = serde_json::to_value(report).unwrap();

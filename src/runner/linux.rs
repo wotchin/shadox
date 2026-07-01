@@ -4,9 +4,10 @@ use crate::metadata::{SCHEMA_VERSION, SHADOX_VERSION};
 use crate::observer::Observer;
 use crate::report::{
     CgroupStats, Confidence, EnvReport, FailureClassification, FailureKind, OutputReport,
-    ResourceUsage, RunReport,
+    ResourceUsage, RunReport, VersionedFsReport,
 };
 use crate::trace::{TraceContext, TraceLogger};
+use crate::versioned_fs::WorkspaceTransaction;
 use anyhow::Context;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -85,6 +86,8 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
             }
         }),
     )?;
+
+    let versioned_run = prepare_versioned_workspace(&effective, run_id, &logger)?;
 
     let mut denials = Vec::new();
     let mut prepared = PreparedSandbox::prepare(
@@ -263,6 +266,13 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         .chain(args)
         .collect::<Vec<_>>();
     let hints = diagnostic_hints(&failure, &effective, &output);
+    let fs_report = finish_versioned_workspace(
+        versioned_run,
+        matches!(failure.kind, FailureKind::Success),
+        effective.versioned_workspace.rollback_on_failure,
+        effective.versioned_workspace.commit_on_success,
+        &logger,
+    )?;
     let report = RunReport {
         schema_version: SCHEMA_VERSION,
         shadox_version: SHADOX_VERSION.to_string(),
@@ -282,6 +292,7 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
         denials,
         findings: logger.findings(),
         hints,
+        fs: fs_report,
     };
 
     logger.emit(
@@ -306,6 +317,87 @@ pub fn run(spec: SandboxSpec) -> anyhow::Result<RunReport> {
     summary.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
     summary.write_all(b"\n")?;
     Ok(report)
+}
+
+fn prepare_versioned_workspace(
+    policy: &EffectivePolicy,
+    run_id: Uuid,
+    logger: &TraceLogger,
+) -> anyhow::Result<Option<WorkspaceTransaction>> {
+    let Some(workspace) = &policy.versioned_workspace.workspace else {
+        return Ok(None);
+    };
+    let (transaction, checkpoint) = WorkspaceTransaction::begin(workspace, run_id)
+        .with_context(|| format!("failed to checkpoint workspace {}", workspace.display()))?;
+    logger.emit(
+        "fs.checkpoint",
+        None,
+        "info",
+        json!({
+            "phase": "before",
+            "workspace": transaction.workspace(),
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "entry_count": checkpoint.entries.len(),
+        }),
+    )?;
+    Ok(Some(transaction))
+}
+
+fn finish_versioned_workspace(
+    versioned_run: Option<WorkspaceTransaction>,
+    command_succeeded: bool,
+    rollback_on_failure: bool,
+    commit_on_success: bool,
+    logger: &TraceLogger,
+) -> anyhow::Result<Option<VersionedFsReport>> {
+    let Some(transaction) = versioned_run else {
+        return Ok(None);
+    };
+    let outcome = transaction.finish(command_succeeded, rollback_on_failure, commit_on_success)?;
+    logger.emit(
+        "fs.diff",
+        None,
+        "info",
+        json!({
+            "workspace": &outcome.workspace,
+            "checkpoint_before": &outcome.checkpoint_before,
+            "checkpoint_after": &outcome.checkpoint_after,
+            "journal_path": &outcome.journal_path,
+            "changed_files": outcome.changed_files,
+            "changes": &outcome.changes,
+        }),
+    )?;
+    if outcome.committed {
+        logger.emit(
+            "fs.commit",
+            None,
+            "info",
+            json!({ "checkpoint_id": &outcome.checkpoint_after }),
+        )?;
+    }
+    if outcome.rolled_back {
+        logger.emit(
+            "fs.rollback",
+            None,
+            "warn",
+            json!({
+                "checkpoint_id": &outcome.checkpoint_before,
+                "rollback": &outcome.rollback,
+            }),
+        )?;
+    }
+    Ok(Some(VersionedFsReport {
+        enabled: true,
+        workspace: outcome.workspace,
+        checkpoint_before: outcome.checkpoint_before,
+        checkpoint_after: outcome.checkpoint_after,
+        journal_path: outcome.journal_path,
+        changed_files: outcome.changed_files,
+        changes: outcome.changes,
+        committed: outcome.committed,
+        rolled_back: outcome.rolled_back,
+        rollback: outcome.rollback,
+    }))
 }
 
 pub fn check_env() -> EnvReport {

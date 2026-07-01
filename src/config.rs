@@ -19,6 +19,8 @@ pub struct SandboxSpec {
     pub security: SecuritySpec,
     #[serde(default)]
     pub observe: ObserveSpec,
+    #[serde(default)]
+    pub versioned_workspace: VersionedWorkspaceSpec,
 }
 
 impl SandboxSpec {
@@ -44,6 +46,7 @@ impl SandboxSpec {
             fs: self.fs.clone(),
             security: self.security.clone(),
             observe: self.observe.clone(),
+            versioned_workspace: self.versioned_workspace.clone(),
             notes: Vec::new(),
         };
 
@@ -91,6 +94,7 @@ pub struct EffectivePolicy {
     pub fs: FsSpec,
     pub security: SecuritySpec,
     pub observe: ObserveSpec,
+    pub versioned_workspace: VersionedWorkspaceSpec,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -229,6 +233,15 @@ pub struct ObserveSpec {
     #[serde(default = "default_max_trace_output_bytes")]
     pub max_trace_output_bytes: Option<u64>,
     pub rhai_script: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VersionedWorkspaceSpec {
+    pub workspace: Option<PathBuf>,
+    #[serde(default)]
+    pub rollback_on_failure: bool,
+    #[serde(default)]
+    pub commit_on_success: bool,
 }
 
 impl Default for ObserveSpec {
